@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 import pyarrow.parquet as pq
-from openreward.environments.types import TextBlock
+from openreward.api.environments.types import TextBlock
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
