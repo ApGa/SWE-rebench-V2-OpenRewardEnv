@@ -26,10 +26,17 @@ parser.add_argument(
     "--verbose", "-v", action="store_true",
     help="Apply gold+test patches manually, run tests, and show parser diagnostics",
 )
+parser.add_argument(
+    "--base-url",
+    default=os.getenv("OPENREWARD_LOCAL_URL", "http://localhost:8080"),
+    help="Local environment server URL (default: http://localhost:8080)",
+)
 args = parser.parse_args()
 
 os.environ["DATA_DIR"] = str(args.data_dir)
 os.environ["TASK_INDEX"] = str(args.data_dir / "task_index.json")
+os.environ["OPENREWARD_API_URL"] = args.base_url
+os.environ["OPENREWARD_SESSION_URL"] = args.base_url
 
 from openreward import OpenReward  # noqa: E402
 
@@ -65,7 +72,7 @@ print(f"Log parser: {install_config.get('log_parser')}")
 print(f"FAIL_TO_PASS ({len(fail_to_pass)}): {fail_to_pass[:3]}{'...' if len(fail_to_pass) > 3 else ''}")
 print(f"PASS_TO_PASS: {len(pass_to_pass)} tests\n")
 
-or_client = OpenReward()
+or_client = OpenReward(base_url=args.base_url)
 environment = or_client.environments.get(name="nebius/SWE-rebench-V2")
 
 ok = True

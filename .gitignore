@@ -2,3 +2,7 @@
 .claude/
 __pycache__/
 task_description.md
+data/
+*.parquet
+*.sqsh
+task_index.json

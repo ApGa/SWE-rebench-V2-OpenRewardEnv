@@ -1,33 +1,28 @@
 """OpenReward environment for SWE-rebench-V2."""
+import asyncio
 import base64
 import os
 import re
 from pathlib import Path
+from typing import Any, cast
 
-import pyarrow.parquet as pq
 from openreward import AsyncOpenReward, SandboxSettings
+from openreward.api.sandboxes.types import MachineSize
 from openreward.environments import Environment, Server, tool
 from openreward.environments.types import Blocks, JSONObject, TextBlock, ToolOutput
 from pydantic import BaseModel, Field
 
+from dataset_store import TaskDataset
 from log_parsers import TestStatus
+from sandbox_backends import create_local_sandbox
 
 # ---------------------------------------------------------------------------
-# Dataset loading — full Arrow table in memory (column-pruned, ~2 GB)
+# Dataset loading — lazy row-group reads from one file or multiple shards
 # ---------------------------------------------------------------------------
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/orwd_data"))
-
-_TASK_COLUMNS = [
-    "instance_id", "repo", "base_commit", "test_patch", "problem_statement",
-    "image_name", "language", "FAIL_TO_PASS", "PASS_TO_PASS", "install_config",
-]
-
-_parquet_path = DATA_DIR / "data.parquet"
-if not _parquet_path.exists():
-    _parquet_path = Path("data") / "data.parquet"
-
-_TASK_TABLE = pq.read_table(str(_parquet_path), columns=_TASK_COLUMNS)
+TASK_INDEX = Path(os.getenv("TASK_INDEX", DATA_DIR / "task_index.json"))
+_TASK_DATASET = TaskDataset(DATA_DIR, index_path=TASK_INDEX)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +95,31 @@ def _text_output(text: str, finished: bool = False) -> ToolOutput:
     return ToolOutput(blocks=[TextBlock(text=text)], finished=finished)
 
 
+def _result_values(result: Any) -> tuple[str, int]:
+    """Normalize hosted and local sandbox command results."""
+    output = getattr(result, "output", None)
+    if output is not None:
+        return str(output), int(
+            getattr(result, "return_code", getattr(result, "exit_code", 0))
+        )
+    output, return_code = result
+    return str(output), int(return_code)
+
+
+def _bounded_output(output: str) -> str:
+    max_chars = int(os.getenv("SWE_TOOL_OUTPUT_MAX_CHARS", "50000"))
+    if len(output) <= max_chars:
+        return output
+    omitted = len(output) - max_chars
+    start_chars = max_chars // 2
+    end_chars = max_chars - start_chars
+    return (
+        output[:start_chars]
+        + f"\n\n... [truncated {omitted} characters] ...\n\n"
+        + output[-end_chars:]
+    )
+
+
 # Same pattern as ANSI_ESCAPE_RE in log_parsers.py
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -129,18 +149,32 @@ def _get_log_parser(parser_name: str):
 class SWERebenchV2(Environment):
     """OpenReward environment for SWE-rebench-V2 tasks."""
 
-    def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
+    def __init__(
+        self,
+        task_spec: JSONObject,
+        secrets: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(task_spec)
         self.parsed = TaskSpec.model_validate(task_spec)
 
-        self.or_client = AsyncOpenReward(api_key=secrets.get("api_key"))
+        secrets = secrets or {}
         self.workdir: str | None = None  # resolved in setup() from container WORKDIR
-        self.sandbox_settings = SandboxSettings(
-            environment=ENVIRONMENT_NAME,
-            image=self.parsed.image_name,
-            machine_size="2:4"
-        )
-        self.sandbox = self.or_client.sandbox(self.sandbox_settings)
+        runtime = os.getenv("SWE_SANDBOX_RUNTIME", "hosted").strip().lower()
+        if runtime == "hosted":
+            self.or_client = AsyncOpenReward(api_key=secrets.get("api_key"))
+            self.sandbox_settings = SandboxSettings(
+                environment=ENVIRONMENT_NAME,
+                image=self.parsed.image_name,
+                machine_size=cast(
+                    MachineSize,
+                    os.getenv("SWE_SANDBOX_MACHINE_SIZE", "2:4"),
+                ),
+            )
+            self.sandbox: Any = self.or_client.sandbox(self.sandbox_settings)
+        else:
+            self.or_client = None
+            self.sandbox_settings = None
+            self.sandbox = create_local_sandbox(runtime, self.parsed.image_name)
 
     # ----- splits / tasks (class methods) -----
 
@@ -158,19 +192,13 @@ class SWERebenchV2(Environment):
     async def num_tasks(cls, split: str) -> int:
         if split != "train":
             raise ValueError(f"Unknown split: {split!r}")
-        return _TASK_TABLE.num_rows
+        return _TASK_DATASET.num_tasks
 
     @classmethod
     async def get_task(cls, split: str, index: int) -> JSONObject:
         if split != "train":
             raise ValueError(f"Unknown split: {split!r}")
-        if index < 0 or index >= _TASK_TABLE.num_rows:
-            raise IndexError(
-                f"Task index {index} out of range (0..{_TASK_TABLE.num_rows - 1})"
-            )
-
-        row_slice = _TASK_TABLE.slice(index, 1)
-        row = {col: row_slice.column(col)[0].as_py() for col in _TASK_COLUMNS}
+        row = await asyncio.to_thread(_TASK_DATASET.get_task, index)
         row["FAIL_TO_PASS"] = [_strip_ansi(t) for t in row["FAIL_TO_PASS"]]
         row["PASS_TO_PASS"] = [_strip_ansi(t) for t in row["PASS_TO_PASS"]]
         return row
@@ -178,29 +206,49 @@ class SWERebenchV2(Environment):
     # ----- lifecycle -----
 
     async def setup(self):
-        await self.sandbox.start()
-        # SWE-rebench V2 images use /{project_name} as WORKDIR (not /testbed).
-        # Query the container's actual WORKDIR so we don't have to guess.
-        res = await self.sandbox.run("pwd")
-        self.workdir = res.output.strip()
-        # Configure git
-        await self.sandbox.run(
-            f"cd {_shell_quote(self.workdir)} && "
-            "git config --global --add safe.directory '*' && "
-            "git config user.email 'agent@openreward.dev' && "
-            "git config user.name 'Agent'"
-        )
-        # Checkout the base commit
-        await self.sandbox.run(
-            f"cd {_shell_quote(self.workdir)} && "
-            f"git checkout {_shell_quote(self.parsed.base_commit)}"
-        )
-        # Remove git history beyond base_commit so the agent can't peek at the fix
-        await self.sandbox.run(
-            f"cd {_shell_quote(self.workdir)} && "
-            "git reflog expire --expire=now --all && "
-            "git gc --prune=now --quiet"
-        )
+        try:
+            await self.sandbox.start()
+            # SWE-rebench V2 images use /{project_name} as WORKDIR (not /testbed).
+            # Query the container's actual WORKDIR so we don't have to guess.
+            res = await self.sandbox.run("pwd")
+            output, exit_code = _result_values(res)
+            if exit_code != 0 or not output.strip():
+                raise RuntimeError(
+                    f"Could not determine sandbox workdir: {output.strip()}"
+                )
+            self.workdir = output.strip()
+
+            setup_commands = [
+                (
+                    "configure git",
+                    f"cd {_shell_quote(self.workdir)} && "
+                    "git config --global --add safe.directory '*' && "
+                    "git config user.email 'agent@openreward.dev' && "
+                    "git config user.name 'Agent'",
+                ),
+                (
+                    "checkout base commit",
+                    f"cd {_shell_quote(self.workdir)} && "
+                    f"git checkout {_shell_quote(self.parsed.base_commit)}",
+                ),
+                (
+                    "remove hidden git history",
+                    f"cd {_shell_quote(self.workdir)} && "
+                    "git reflog expire --expire=now --all && "
+                    "git gc --prune=now --quiet",
+                ),
+            ]
+            for label, command in setup_commands:
+                result = await self.sandbox.run(command)
+                output, exit_code = _result_values(result)
+                if exit_code != 0:
+                    raise RuntimeError(
+                        f"Failed to {label} (exit {exit_code}): "
+                        f"{output.strip()}"
+                    )
+        except Exception:
+            await self.sandbox.stop()
+            raise
 
     async def teardown(self):
         await self.sandbox.stop()
@@ -226,7 +274,9 @@ class SWERebenchV2(Environment):
         """Run a bash command in the container."""
         assert self.workdir is not None, "setup() must run before tools"
         cmd = f"cd {_shell_quote(self.workdir)} && {input.command}"
-        output, exit_code = await self.sandbox.run(cmd)
+        result = await self.sandbox.run(cmd)
+        output, exit_code = _result_values(result)
+        output = _bounded_output(output)
         s = output if output else "(no output)"
         return _text_output(f"{s}\nExit code: {exit_code}")
 
@@ -234,8 +284,7 @@ class SWERebenchV2(Environment):
     async def str_replace(self, input: StrReplaceInput) -> ToolOutput:
         """Replace a unique string in a file with another string."""
         res = await self.sandbox.run(f"cat -- {_shell_quote(input.path)}")
-        content = res.output
-        exit_code = res.return_code
+        content, exit_code = _result_values(res)
         if exit_code != 0:
             s = content if content else "(no output)"
             return _text_output(f"{s}\nExit code: {exit_code}")
@@ -249,7 +298,8 @@ class SWERebenchV2(Environment):
         new_content = content.replace(input.old_str, input.new_str, 1)
         encoded = base64.b64encode(new_content.encode('utf-8')).decode('ascii')
         write_cmd = f"echo '{encoded}' | base64 -d > {_shell_quote(input.path)}"
-        output, exit_code = await self.sandbox.run(write_cmd)
+        result = await self.sandbox.run(write_cmd)
+        output, exit_code = _result_values(result)
 
         s = output if output else f"Successfully replaced string in {input.path}"
         return _text_output(f"{s}\nExit code: {exit_code}")
@@ -258,7 +308,7 @@ class SWERebenchV2(Environment):
     async def view(self, input: ViewInput) -> ToolOutput:
         """View file contents or directory listings."""
         res = await self.sandbox.run(f"test -d {_shell_quote(input.path)} && echo 'dir' || echo 'file'")
-        output = res.output
+        output, _ = _result_values(res)
         is_dir = output.strip() == "dir"
 
         if is_dir:
@@ -274,8 +324,7 @@ class SWERebenchV2(Environment):
                 cmd = f"cat -n {_shell_quote(input.path)}"
 
         res = await self.sandbox.run(cmd)
-        output = res.output
-        exit_code = res.return_code
+        output, exit_code = _result_values(res)
 
         if len(output) > 16000:
             lines = output.split('\n')
@@ -298,7 +347,8 @@ class SWERebenchV2(Environment):
 
         encoded = base64.b64encode(input.file_text.encode('utf-8')).decode('ascii')
         write_cmd = f"echo '{encoded}' | base64 -d > {_shell_quote(input.path)}"
-        output, exit_code = await self.sandbox.run(write_cmd)
+        result = await self.sandbox.run(write_cmd)
+        output, exit_code = _result_values(result)
 
         s = output if output else f"Successfully created {input.path}"
         return _text_output(f"{s}\nExit code: {exit_code}")
@@ -314,14 +364,16 @@ class SWERebenchV2(Environment):
         await self.sandbox.run(
             f"echo '{test_patch_encoded}' | base64 -d > /tmp/test_patch.diff"
         )
-        apply_output, apply_code = await self.sandbox.run(
+        apply_result = await self.sandbox.run(
             f"cd {_shell_quote(self.workdir)} && git apply /tmp/test_patch.diff"
         )
+        apply_output, apply_code = _result_values(apply_result)
         if apply_code != 0:
             # Try with --3way as fallback
-            apply_output, apply_code = await self.sandbox.run(
+            apply_result = await self.sandbox.run(
                 f"cd {_shell_quote(self.workdir)} && git apply --3way /tmp/test_patch.diff"
             )
+            apply_output, apply_code = _result_values(apply_result)
             if apply_code != 0:
                 return ToolOutput(
                     blocks=[TextBlock(text=f"Failed to apply test patch:\n{apply_output}")],
@@ -333,9 +385,9 @@ class SWERebenchV2(Environment):
         test_cmd = self.parsed.install_config.test_cmd
         res = await self.sandbox.run(
             f"cd {_shell_quote(self.workdir)} && {test_cmd}",
-            timeout=600,
+            timeout=float(os.getenv("SWE_TEST_TIMEOUT_SECONDS", "600")),
         )
-        test_output, test_code = res.output, res.return_code
+        test_output, test_code = _result_values(res)
 
         # 3. Parse test output
         parser_name = self.parsed.install_config.log_parser
@@ -350,16 +402,38 @@ class SWERebenchV2(Environment):
             )
 
         # 4. Check FAIL_TO_PASS and PASS_TO_PASS
-        fail_to_pass_ok = all(
+        f2p_passed = sum(
             test_results.get(t) == TestStatus.PASSED.value
             for t in self.parsed.FAIL_TO_PASS
         )
-        pass_to_pass_ok = all(
+        p2p_passed = sum(
             test_results.get(t) == TestStatus.PASSED.value
             for t in self.parsed.PASS_TO_PASS
         )
+        fail_to_pass_ok = f2p_passed == len(self.parsed.FAIL_TO_PASS)
+        pass_to_pass_ok = p2p_passed == len(self.parsed.PASS_TO_PASS)
 
-        reward = 1.0 if (fail_to_pass_ok and pass_to_pass_ok) else 0.0
+        binary_reward = 1.0 if (fail_to_pass_ok and pass_to_pass_ok) else 0.0
+        reward_mode = os.getenv(
+            "OPENREWARD_REWARD_MODE", "binary"
+        ).strip().lower()
+        if reward_mode in {"partial", "fractional"}:
+            group_scores = []
+            if self.parsed.FAIL_TO_PASS:
+                group_scores.append(
+                    f2p_passed / len(self.parsed.FAIL_TO_PASS)
+                )
+            if self.parsed.PASS_TO_PASS:
+                group_scores.append(
+                    p2p_passed / len(self.parsed.PASS_TO_PASS)
+                )
+            reward = (
+                sum(group_scores) / len(group_scores)
+                if group_scores
+                else binary_reward
+            )
+        else:
+            reward = binary_reward
 
         # Build summary
         f2p_detail = []
@@ -367,14 +441,11 @@ class SWERebenchV2(Environment):
             status = test_results.get(t, "NOT_FOUND")
             f2p_detail.append(f"  {t}: {status}")
         p2p_total = len(self.parsed.PASS_TO_PASS)
-        p2p_passed = sum(
-            1 for t in self.parsed.PASS_TO_PASS
-            if test_results.get(t) == TestStatus.PASSED.value
-        )
 
         summary = (
             f"Test command exit code: {test_code}\n"
-            f"FAIL_TO_PASS ({len(self.parsed.FAIL_TO_PASS)}):\n" +
+            f"FAIL_TO_PASS: {f2p_passed}/{len(self.parsed.FAIL_TO_PASS)} passed\n"
+            f"FAIL_TO_PASS detail:\n" +
             "\n".join(f2p_detail) + "\n"
             f"PASS_TO_PASS: {p2p_passed}/{p2p_total} passed\n"
             f"Reward: {reward}"
@@ -388,4 +459,8 @@ class SWERebenchV2(Environment):
 
 
 if __name__ == "__main__":
-    Server(environments=[SWERebenchV2]).run()
+    port = int(os.getenv("OPENREWARD_PORT", os.getenv("PORT", "8080")))
+    Server(environments=[SWERebenchV2]).run(
+        host=os.getenv("OPENREWARD_HOST", "0.0.0.0"),
+        port=port,
+    )

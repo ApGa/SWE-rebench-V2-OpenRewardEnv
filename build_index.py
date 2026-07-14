@@ -9,6 +9,7 @@ Usage:
 """
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -16,7 +17,10 @@ import pyarrow.parquet as pq
 
 def build_index(data_dir: Path) -> dict:
     """Scan parquet files and return the index structure."""
-    paths = sorted(data_dir.glob("*.parquet"))
+    single_file = data_dir / "data.parquet"
+    paths = [single_file] if single_file.exists() else sorted(
+        data_dir.rglob("*.parquet")
+    )
     if not paths:
         raise FileNotFoundError(f"No .parquet files found in {data_dir}")
 
@@ -25,7 +29,11 @@ def build_index(data_dir: Path) -> dict:
     cum = 0
     for p in paths:
         n = pq.ParquetFile(p).metadata.num_rows
-        files.append({"path": p.name, "offset": cum, "num_rows": n})
+        files.append({
+            "path": str(p.relative_to(data_dir)),
+            "offset": cum,
+            "num_rows": n,
+        })
         cum += n
     total_rows = cum
 
@@ -53,21 +61,26 @@ def build_index(data_dir: Path) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--data-dir", type=Path, default=Path("/orwd_data"),
+        "--data-dir",
+        type=Path,
+        default=Path(os.getenv("DATA_DIR", "/orwd_data")),
         help="Directory containing the parquet files",
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("task_index.json"),
-        help="Where to write the index",
+        "--output",
+        type=Path,
+        default=None,
+        help="Where to write the index (default: DATA_DIR/task_index.json)",
     )
     args = parser.parse_args()
+    output = args.output or args.data_dir / "task_index.json"
 
     print(f"Scanning {args.data_dir} ...")
     index = build_index(args.data_dir)
-    args.output.write_text(json.dumps(index))
+    output.write_text(json.dumps(index))
     print(
         f"Done. {index['num_valid']}/{index['total_rows']} valid tasks "
-        f"written to {args.output}"
+        f"written to {output}"
     )
 
 

@@ -1,9 +1,11 @@
 {
+  "venvPath": ".",
+  "venv": ".venv",
   "include": [
-    "**.py"
+    "**/*.py"
   ],
   "exclude": [
-    "venv",
-    ".venv"
+    ".venv",
+    "data"
   ]
 }

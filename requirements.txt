@@ -1,4 +1,4 @@
-openreward>=0.1.118
-pydantic>=2.0
-pyarrow>=14.0
-pyright>=1.1.409
+openreward==0.1.137
+pydantic>=2.0,<3
+pyarrow>=14.0,<26
+pyright==1.1.411
