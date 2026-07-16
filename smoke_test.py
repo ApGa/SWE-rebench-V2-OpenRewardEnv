@@ -6,12 +6,12 @@ Usage:
 """
 import argparse
 import base64
-import json
 import os
 from pathlib import Path
 
-import pyarrow.parquet as pq
 from openreward.api.environments.types import TextBlock
+
+from dataset_store import TaskDataset
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
@@ -40,29 +40,29 @@ os.environ["OPENREWARD_SESSION_URL"] = args.base_url
 
 from openreward import OpenReward  # noqa: E402
 
-# Load the valid-index mapping and read relevant fields from parquet
-index_meta = json.loads((args.data_dir / "task_index.json").read_text())
-raw_idx = index_meta["valid_indices"][args.index]
-
-parquet_files = sorted(args.data_dir.glob("*.parquet"))
-table = pq.read_table(
-    parquet_files,
-    columns=["instance_id", "patch", "test_patch", "install_config", "FAIL_TO_PASS", "PASS_TO_PASS"],
+# Read just this task's evaluation fields from its parquet row group.
+dataset = TaskDataset(
+    args.data_dir,
+    index_path=args.data_dir / "task_index.json",
 )
-instance_id = table.column("instance_id")[raw_idx].as_py()
-gold_patch = table.column("patch")[raw_idx].as_py()
-test_patch = table.column("test_patch")[raw_idx].as_py()
-install_config = table.column("install_config")[raw_idx].as_py()
-fail_to_pass = table.column("FAIL_TO_PASS")[raw_idx].as_py()
-pass_to_pass = table.column("PASS_TO_PASS")[raw_idx].as_py()
-del table
-
-if isinstance(install_config, str):
-    install_config = json.loads(install_config)
-if isinstance(fail_to_pass, str):
-    fail_to_pass = json.loads(fail_to_pass)
-if isinstance(pass_to_pass, str):
-    pass_to_pass = json.loads(pass_to_pass)
+raw_idx = dataset.raw_index(args.index)
+row = dataset.get_row(
+    args.index,
+    columns=[
+        "instance_id",
+        "patch",
+        "test_patch",
+        "install_config",
+        "FAIL_TO_PASS",
+        "PASS_TO_PASS",
+    ],
+)
+instance_id = row["instance_id"]
+gold_patch = row["patch"]
+test_patch = row["test_patch"]
+install_config = row["install_config"]
+fail_to_pass = row["FAIL_TO_PASS"]
+pass_to_pass = row["PASS_TO_PASS"]
 
 print(f"=== Task {args.index} (raw={raw_idx}): {instance_id} ===")
 print(f"Gold patch: {len(gold_patch)} bytes")
@@ -124,22 +124,21 @@ with environment.session(split="train", index=args.index) as session:
         print("✗ Should have failed before patch!\n")
         ok = False
 
-# --- Phase 2: apply gold patch, then submit, expect reward=1 ---
-print("=" * 60)
-print("PHASE 2: Apply gold patch, then submit (expect reward=1)")
-print("=" * 60)
+# -v: diagnose in a disposable session so test-patch files cannot leak into
+# the session used for the real submission.
+if args.verbose:
+    print("=" * 60)
+    print("DIAGNOSTIC: Apply gold + test patches and inspect parser output")
+    print("=" * 60)
+    with environment.session(split="train", index=args.index) as session:
+        if not apply_patch(session, gold_patch, "gold"):
+            print("✗ Failed to apply gold patch")
+            ok = False
 
-with environment.session(split="train", index=args.index) as session:
-    # Apply gold patch
-    if not apply_patch(session, gold_patch, "gold"):
-        print("✗ Failed to apply gold patch")
-        ok = False
-
-    # -v: replicate what submit_answer does — apply test patch, run tests, parse
-    if args.verbose:
         print("\n--- Applying test patch (replicating submit_answer) ---")
         if not apply_patch(session, test_patch, "test"):
             print("✗ Failed to apply test patch")
+            ok = False
 
         test_cmd = install_config["test_cmd"]
         print(f"\n--- Running: {test_cmd} ---")
@@ -159,27 +158,29 @@ with environment.session(split="train", index=args.index) as session:
             clean_output = raw_output.rsplit("\nExit code:", 1)[0]
             parsed = parser_fn(clean_output)
             print(f"Parser returned {len(parsed)} test results")
-            for i, (k, v) in enumerate(list(parsed.items())[:5]):
-                print(f"  {k!r}: {v!r}")
+            for key, value in list(parsed.items())[:5]:
+                print(f"  {key!r}: {value!r}")
             if len(parsed) > 5:
                 print(f"  ... and {len(parsed) - 5} more")
-            for t in fail_to_pass:
-                clean_t = log_parsers.ansi_escape(t)
-                status = parsed.get(clean_t, "NOT_FOUND")
-                print(f"  FAIL_TO_PASS {clean_t!r} -> {status}")
-        except Exception as e:
-            print(f"Parser error: {e}")
+            for test_id in fail_to_pass:
+                clean_id = log_parsers.ansi_escape(test_id)
+                status = parsed.get(clean_id, "NOT_FOUND")
+                print(f"  FAIL_TO_PASS {clean_id!r} -> {status}")
+        except Exception as error:
+            print(f"Parser error: {error}")
+            ok = False
 
-        # Undo the test patch so submit_answer can re-apply it cleanly
-        print("\n--- Reverting test patch ---")
-        session.call_tool("bash", {
-            "command": "git checkout -- .",
-            "description": "Revert test patch before submit",
-        })
-        # Re-apply gold patch since checkout reverted everything
-        apply_patch(session, gold_patch, "gold")
+# --- Phase 2: apply gold patch, then submit, expect reward=1 ---
+print("=" * 60)
+print("PHASE 2: Apply gold patch, then submit (expect reward=1)")
+print("=" * 60)
 
-    # Submit (applies test patch internally, runs tests, scores)
+with environment.session(split="train", index=args.index) as session:
+    if not apply_patch(session, gold_patch, "gold"):
+        print("✗ Failed to apply gold patch")
+        ok = False
+
+    # Submit applies the held-out test patch internally, then runs and scores it.
     print("\n--- Submitting ---")
     result = session.call_tool("submit_answer", {})
     print(_block_text(result))
@@ -198,3 +199,7 @@ if ok:
     print(f"✓ {instance_id}: reward 0→1 as expected")
 else:
     print(f"✗ {instance_id}: UNEXPECTED RESULTS (pre={pre_reward}, post={post_reward})")
+
+or_client.close()
+if not ok:
+    raise SystemExit(1)

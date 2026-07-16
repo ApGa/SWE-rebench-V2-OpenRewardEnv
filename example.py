@@ -8,7 +8,7 @@ from openai.types.shared_params.reasoning import Reasoning
 from openreward import OpenReward
 from openreward.environments.types import TextBlock
 import json
-import pyarrow.parquet as pq
+from dataset_store import TaskDataset
 
 or_client = OpenReward()
 oai_client = OpenAI()
@@ -72,19 +72,21 @@ environment = or_client.environments.get(name="nebius/SWE-rebench-V2")
 tools = environment.list_tools(format="openai")
 
 TASK_INDEX = 1
+DATA_DIR = Path(
+    os.getenv("DATA_DIR", "~/data/SWE-rebench-V2")
+).expanduser()
+dataset = TaskDataset(DATA_DIR, index_path=DATA_DIR / "task_index.json")
+task_data = dataset.get_row(
+    TASK_INDEX,
+    columns=["instance_id", "patch", "test_patch", "FAIL_TO_PASS"],
+)
 
 with environment.session(split="train", index=TASK_INDEX) as session:
 
-    index_meta = json.loads(open(os.path.expanduser("~/data/SWE-rebench-V2/task_index.json")).read())
-    raw_idx = index_meta["valid_indices"][TASK_INDEX]
-
-    parquet_files = sorted(Path(os.path.expanduser("~/data/SWE-rebench-V2")).glob("*.parquet"))
-    table = pq.read_table(parquet_files, columns=["instance_id", "patch", "test_patch", "FAIL_TO_PASS"])
-    instance_id = table.column("instance_id")[raw_idx].as_py()
-    gold_patch = table.column("patch")[raw_idx].as_py()
-    test_patch = table.column("test_patch")[raw_idx].as_py()
-    fail_to_pass = table.column("FAIL_TO_PASS")[raw_idx].as_py()
-    del table
+    instance_id = task_data["instance_id"]
+    gold_patch = task_data["patch"]
+    test_patch = task_data["test_patch"]
+    fail_to_pass = task_data["FAIL_TO_PASS"]
 
     print(f"\n{BOLD}🔍 Task: {instance_id}{RESET}")
     print(f"{BOLD}FAIL_TO_PASS:{RESET} {fail_to_pass}")

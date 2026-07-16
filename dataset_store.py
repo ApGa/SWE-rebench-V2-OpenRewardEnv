@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pyarrow.parquet as pq
 
@@ -97,7 +97,8 @@ class TaskDataset:
             return len(self.valid_indices)
         return self.total_rows
 
-    def _raw_index(self, task_index: int) -> int:
+    def raw_index(self, task_index: int) -> int:
+        """Resolve a public task index through ``task_index.json``."""
         if task_index < 0 or task_index >= self.num_tasks:
             raise IndexError(
                 f"Task index {task_index} out of range "
@@ -113,8 +114,22 @@ class TaskDataset:
                 return shard, raw_index - shard.offset
         raise IndexError(f"Raw task index {raw_index} is outside the dataset")
 
-    def get_task(self, task_index: int) -> dict[str, Any]:
-        raw_index = self._raw_index(task_index)
+    def get_row(
+        self,
+        task_index: int,
+        *,
+        columns: Sequence[str],
+    ) -> dict[str, Any]:
+        """Read selected columns for one indexed task from one row group.
+
+        This is also used by local smoke and rollout examples that need
+        evaluation-only columns such as ``patch``. Keeping those callers on
+        this path avoids loading every patch in the 32K+ row dataset.
+        """
+        if not columns:
+            raise ValueError("columns must not be empty")
+
+        raw_index = self.raw_index(task_index)
         shard, file_index = self._locate_shard(raw_index)
         parquet_file = pq.ParquetFile(shard.path)
 
@@ -127,11 +142,11 @@ class TaskDataset:
                 row_offset = file_index - row_group_offset
                 table = parquet_file.read_row_group(
                     row_group_index,
-                    columns=TASK_COLUMNS,
+                    columns=list(columns),
                 )
                 row = {
                     column: table.column(column)[row_offset].as_py()
-                    for column in TASK_COLUMNS
+                    for column in columns
                 }
                 return self._normalize_row(row)
             row_group_offset += row_group_rows
@@ -140,10 +155,15 @@ class TaskDataset:
             f"Task index {task_index} could not be located in {shard.path}"
         )
 
+    def get_task(self, task_index: int) -> dict[str, Any]:
+        return self.get_row(task_index, columns=TASK_COLUMNS)
+
     @staticmethod
     def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         for key in ("FAIL_TO_PASS", "PASS_TO_PASS"):
-            value = row.get(key)
+            if key not in row:
+                continue
+            value = row[key]
             if isinstance(value, str):
                 row[key] = json.loads(value)
             elif value is None:

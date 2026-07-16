@@ -19,6 +19,7 @@ def _task(instance_id: str, test_cmd: str) -> dict:
         "instance_id": instance_id,
         "repo": "example/repo",
         "base_commit": "abc123",
+        "patch": f"gold patch for {instance_id}",
         "test_patch": "",
         "problem_statement": "Fix the bug",
         "image_name": "docker.io/library/alpine:3.20",
@@ -39,14 +40,16 @@ class TaskDatasetTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             rows = [_task("task-0", "pytest"), _task("task-1", "")]
+            shards_dir = data_dir / "data"
+            shards_dir.mkdir()
             pq.write_table(
                 pa.Table.from_pylist(rows),
-                data_dir / "part-0.parquet",
+                shards_dir / "part-0.parquet",
                 row_group_size=1,
             )
             pq.write_table(
                 pa.Table.from_pylist([_task("task-2", "go test ./...")]),
-                data_dir / "part-1.parquet",
+                shards_dir / "part-1.parquet",
                 row_group_size=1,
             )
 
@@ -59,6 +62,19 @@ class TaskDatasetTest(unittest.TestCase):
             self.assertEqual(dataset.num_tasks, 2)
             self.assertEqual(dataset.get_task(0)["instance_id"], "task-0")
             self.assertEqual(dataset.get_task(1)["instance_id"], "task-2")
+            self.assertEqual(dataset.raw_index(1), 2)
+            self.assertEqual(
+                dataset.get_row(
+                    1,
+                    columns=["instance_id", "patch"],
+                ),
+                {
+                    "instance_id": "task-2",
+                    "patch": "gold patch for task-2",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "columns must not be empty"):
+                dataset.get_row(0, columns=[])
 
     def test_reports_out_of_range_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

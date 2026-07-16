@@ -13,7 +13,7 @@ from openreward.environments.types import Blocks, JSONObject, TextBlock, ToolOut
 from pydantic import BaseModel, Field
 
 from dataset_store import TaskDataset
-from log_parsers import TestStatus
+from scoring import score_test_results
 from sandbox_backends import create_local_sandbox
 
 # ---------------------------------------------------------------------------
@@ -402,38 +402,15 @@ class SWERebenchV2(Environment):
             )
 
         # 4. Check FAIL_TO_PASS and PASS_TO_PASS
-        f2p_passed = sum(
-            test_results.get(t) == TestStatus.PASSED.value
-            for t in self.parsed.FAIL_TO_PASS
+        score = score_test_results(
+            test_results,
+            self.parsed.FAIL_TO_PASS,
+            self.parsed.PASS_TO_PASS,
+            reward_mode=os.getenv("OPENREWARD_REWARD_MODE", "binary"),
         )
-        p2p_passed = sum(
-            test_results.get(t) == TestStatus.PASSED.value
-            for t in self.parsed.PASS_TO_PASS
-        )
-        fail_to_pass_ok = f2p_passed == len(self.parsed.FAIL_TO_PASS)
-        pass_to_pass_ok = p2p_passed == len(self.parsed.PASS_TO_PASS)
-
-        binary_reward = 1.0 if (fail_to_pass_ok and pass_to_pass_ok) else 0.0
-        reward_mode = os.getenv(
-            "OPENREWARD_REWARD_MODE", "binary"
-        ).strip().lower()
-        if reward_mode in {"partial", "fractional"}:
-            group_scores = []
-            if self.parsed.FAIL_TO_PASS:
-                group_scores.append(
-                    f2p_passed / len(self.parsed.FAIL_TO_PASS)
-                )
-            if self.parsed.PASS_TO_PASS:
-                group_scores.append(
-                    p2p_passed / len(self.parsed.PASS_TO_PASS)
-                )
-            reward = (
-                sum(group_scores) / len(group_scores)
-                if group_scores
-                else binary_reward
-            )
-        else:
-            reward = binary_reward
+        f2p_passed = score.fail_to_pass_passed
+        p2p_passed = score.pass_to_pass_passed
+        reward = score.reward
 
         # Build summary
         f2p_detail = []
