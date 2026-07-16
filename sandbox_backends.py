@@ -170,12 +170,30 @@ class DockerSandbox:
         self.started = False
 
 
+_DOCKER_HUB_REGISTRIES = frozenset(
+    {"docker.io", "index.docker.io", "registry-1.docker.io"}
+)
+
+
 def _enroot_import_uri(image: str) -> str:
-    if image.startswith(("docker://", "dockerd://", "podman://")):
+    if image.startswith(("dockerd://", "podman://")):
+        return image
+    if image.startswith("docker://"):
+        target = image.removeprefix("docker://")
+        for registry in _DOCKER_HUB_REGISTRIES:
+            for delimiter in ("#", "/"):
+                prefix = f"{registry}{delimiter}"
+                if target.startswith(prefix):
+                    return f"docker://{target.removeprefix(prefix)}"
         return image
 
     image = image.removeprefix("https://").removeprefix("http://")
     first, separator, rest = image.partition("/")
+    # Enroot 3.5 expects Docker Hub's native shorthand. Treating docker.io as
+    # a custom registry (docker://docker.io#...) can fail to parse multi-arch
+    # manifests even though docker://namespace/image succeeds.
+    if separator and first in _DOCKER_HUB_REGISTRIES:
+        return f"docker://{rest}"
     if separator and ("." in first or ":" in first or first == "localhost"):
         return f"docker://{first}#{rest}"
     return f"docker://{image}"

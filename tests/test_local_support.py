@@ -102,15 +102,35 @@ class SandboxHelpersTest(unittest.TestCase):
     def test_enroot_registry_uri_conversion(self) -> None:
         self.assertEqual(
             _enroot_import_uri("docker.io/swerebenchv2/repo:tag"),
-            "docker://docker.io#swerebenchv2/repo:tag",
+            "docker://swerebenchv2/repo:tag",
+        )
+        self.assertEqual(
+            _enroot_import_uri("registry-1.docker.io/library/ubuntu:22.04"),
+            "docker://library/ubuntu:22.04",
+        )
+        self.assertEqual(
+            _enroot_import_uri("docker://docker.io#swerebenchv2/repo:tag"),
+            "docker://swerebenchv2/repo:tag",
+        )
+        self.assertEqual(
+            _enroot_import_uri("docker://docker.io/swerebenchv2/repo:tag"),
+            "docker://swerebenchv2/repo:tag",
         )
         self.assertEqual(
             _enroot_import_uri("ubuntu:22.04"),
             "docker://ubuntu:22.04",
         )
         self.assertEqual(
-            _enroot_import_uri("docker://registry.example#team/image:tag"),
-            "docker://registry.example#team/image:tag",
+            _enroot_import_uri("ghcr.io/team/image:tag"),
+            "docker://ghcr.io#team/image:tag",
+        )
+        self.assertEqual(
+            _enroot_import_uri("localhost:5000/team/image:tag"),
+            "docker://localhost:5000#team/image:tag",
+        )
+        self.assertEqual(
+            _enroot_import_uri("docker://ghcr.io#team/image:tag"),
+            "docker://ghcr.io#team/image:tag",
         )
 
     def test_local_result_supports_hosted_result_call_pattern(self) -> None:
