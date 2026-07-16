@@ -352,29 +352,29 @@ class SWERebenchV2(Environment):
     async def submit_answer(self) -> ToolOutput:
         """Submit your solution. Applies the test patch, runs the test suite, and scores."""
         assert self.workdir is not None, "setup() must run before tools"
-        # 1. Write test_patch to a file and apply it
+        # 1. Apply the held-out patch from stdin. Enroot starts a fresh mount
+        # namespace for each command, so a file written under /tmp by one run
+        # is not portable to the next run unless the backend mounts session tmp.
         test_patch_encoded = base64.b64encode(
-            self.parsed.test_patch.encode('utf-8')
-        ).decode('ascii')
-        await self.sandbox.run(
-            f"echo '{test_patch_encoded}' | base64 -d > /tmp/test_patch.diff"
-        )
+            self.parsed.test_patch.encode("utf-8")
+        ).decode("ascii")
+        patch_stream = f"echo '{test_patch_encoded}' | base64 -d"
         apply_result = await self.sandbox.run(
-            f"cd {_shell_quote(self.workdir)} && git apply /tmp/test_patch.diff"
+            f"cd {_shell_quote(self.workdir)} && "
+            f"({patch_stream} | git apply - || "
+            f"{patch_stream} | git apply --3way -)"
         )
         apply_output, apply_code = _result_values(apply_result)
         if apply_code != 0:
-            # Try with --3way as fallback
-            apply_result = await self.sandbox.run(
-                f"cd {_shell_quote(self.workdir)} && git apply --3way /tmp/test_patch.diff"
+            return ToolOutput(
+                blocks=[
+                    TextBlock(
+                        text=f"Failed to apply test patch:\n{apply_output}"
+                    )
+                ],
+                reward=0.0,
+                finished=True,
             )
-            apply_output, apply_code = _result_values(apply_result)
-            if apply_code != 0:
-                return ToolOutput(
-                    blocks=[TextBlock(text=f"Failed to apply test patch:\n{apply_output}")],
-                    reward=0.0,
-                    finished=True,
-                )
 
         # 2. Run test command
         test_script = build_test_command_script(

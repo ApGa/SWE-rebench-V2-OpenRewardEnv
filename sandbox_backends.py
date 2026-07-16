@@ -199,6 +199,7 @@ class EnrootSandbox:
             os.getenv("SWE_SANDBOX_COMMAND_TIMEOUT_SECONDS", "600")
         )
         self.root_remap = _env_bool("SWE_ENROOT_ROOT_REMAP", True)
+        self.session_tmp_dir: Path | None = None
         self.started = False
 
     def _cached_image_path(self) -> Path:
@@ -262,6 +263,9 @@ class EnrootSandbox:
             if mount:
                 args += ["--mount", mount]
 
+        if self.session_tmp_dir is None:
+            raise RuntimeError("Enroot sandbox session tmp has not been created")
+        args += ["--mount", f"{self.session_tmp_dir}:/tmp"]
         args += [self.name, "/bin/sh", "-lc", command]
         return args
 
@@ -270,6 +274,16 @@ class EnrootSandbox:
             raise RuntimeError("SWE_SANDBOX_RUNTIME=enroot requires the enroot CLI")
 
         image_path = await asyncio.to_thread(self._ensure_image_sync)
+        tmp_root_value = os.getenv("SWE_ENROOT_SESSION_TMP_ROOT")
+        tmp_root = Path(tmp_root_value).expanduser() if tmp_root_value else None
+        if tmp_root is not None:
+            tmp_root.mkdir(parents=True, exist_ok=True)
+        self.session_tmp_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"{self.name}-tmp-",
+                dir=tmp_root,
+            )
+        )
         result = await _run_process(
             ["enroot", "create", "--name", self.name, str(image_path)],
             timeout=float(os.getenv("SWE_SANDBOX_CREATE_TIMEOUT_SECONDS", "1800")),
@@ -293,8 +307,16 @@ class EnrootSandbox:
         )
 
     async def stop(self) -> None:
-        await _run_process(["enroot", "remove", "-f", self.name], timeout=120)
-        self.started = False
+        try:
+            await _run_process(
+                ["enroot", "remove", "-f", self.name],
+                timeout=120,
+            )
+        finally:
+            if self.session_tmp_dir is not None:
+                shutil.rmtree(self.session_tmp_dir, ignore_errors=True)
+                self.session_tmp_dir = None
+            self.started = False
 
 
 def create_local_sandbox(runtime: str, image: str) -> SandboxBackend:

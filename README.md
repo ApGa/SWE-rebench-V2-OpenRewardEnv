@@ -125,6 +125,9 @@ The server port can be set with `OPENREWARD_PORT` (preferred) or `PORT`.
 - `SWE_SANDBOX_CREATE_TIMEOUT_SECONDS`: image import/create timeout; default 1800.
 - `SWE_TOOL_OUTPUT_MAX_CHARS`: maximum returned command output; default 50000.
 - `SWE_ENROOT_IMAGE_CACHE`: squashfs cache location.
+- `SWE_ENROOT_SESSION_TMP_ROOT`: parent directory for per-session `/tmp`
+  bind mounts. Defaults to the system temporary directory; use node-local
+  storage for production rollouts.
 - `SWE_ENROOT_ROOT_REMAP`: pass `--root` to Enroot; enabled by default.
 - `SWE_ENROOT_MOUNTS`: semicolon-separated Enroot mounts such as
   `/scratch:/scratch;/datasets:/datasets`.

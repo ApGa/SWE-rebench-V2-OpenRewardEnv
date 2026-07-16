@@ -162,10 +162,20 @@ exit 2
 
                 async def exercise() -> None:
                     await sandbox.start()
+                    session_tmp = sandbox.session_tmp_dir
+                    self.assertIsNotNone(session_tmp)
+                    assert session_tmp is not None
+                    self.assertTrue(session_tmp.is_dir())
+                    self.assertIn(
+                        f"{session_tmp}:/tmp",
+                        sandbox._start_args("echo hello"),
+                    )
                     result = await sandbox.run("echo hello")
                     self.assertEqual(result.return_code, 0)
                     self.assertEqual(result.output, "fake command output")
                     await sandbox.stop()
+                    self.assertIsNone(sandbox.session_tmp_dir)
+                    self.assertFalse(session_tmp.exists())
 
                 asyncio.run(exercise())
                 self.assertEqual(
