@@ -330,6 +330,12 @@ class EnrootSandbox:
         return await _run_process(
             self._start_args(command),
             timeout=self.default_timeout if timeout is None else timeout,
+            # Some cluster installations enable an Enroot hook that
+            # bind-mounts the caller's home directory by default. Never let
+            # an untrusted task inherit that host path. An explicit empty
+            # value disables the hook even when the parent environment sets
+            # ENROOT_MOUNT_HOME.
+            env={**os.environ, "ENROOT_MOUNT_HOME": ""},
         )
 
     async def stop(self) -> None:

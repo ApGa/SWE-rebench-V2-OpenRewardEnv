@@ -8,7 +8,6 @@ from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 from build_index import build_index
 from dataset_store import TaskDataset
 from sandbox_backends import EnrootSandbox, LocalRunResult, _enroot_import_uri
@@ -164,6 +163,10 @@ case "$1" in
     exit 0
     ;;
   start)
+    if [ "${ENROOT_MOUNT_HOME+x}" != x ] || [ -n "$ENROOT_MOUNT_HOME" ]; then
+      printf 'unsafe ENROOT_MOUNT_HOME=%s' "${ENROOT_MOUNT_HOME-unset}"
+      exit 3
+    fi
     printf 'fake command output'
     exit 0
     ;;
@@ -175,6 +178,7 @@ exit 2
 
             env = {
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "ENROOT_MOUNT_HOME": str(root / "host-home"),
                 "SWE_ENROOT_IMAGE_CACHE": str(root / "images"),
             }
             with mock.patch.dict(os.environ, env, clear=False):
