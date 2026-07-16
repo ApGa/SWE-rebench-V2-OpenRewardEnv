@@ -1,7 +1,7 @@
 import unittest
 
 from log_parsers import parse_log_pytest
-from scoring import score_test_results
+from scoring import normalize_test_name, score_test_results
 
 
 class RewardScoringTest(unittest.TestCase):
@@ -69,6 +69,27 @@ class RewardScoringTest(unittest.TestCase):
         self.assertEqual(score.fail_to_pass_passed, 1)
         self.assertEqual(score.pass_to_pass_passed, 0)
         self.assertEqual(score.reward, 0.0)
+
+    def test_timing_and_ansi_differences_do_not_change_reward(self) -> None:
+        self.assertEqual(
+            normalize_test_name("\x1b[32mcase [1.34 ms]\x1b[0m"),
+            "case",
+        )
+        self.assertEqual(
+            normalize_test_name("botan case in 29.08 msec"),
+            "botan case",
+        )
+        self.assertEqual(
+            normalize_test_name("case (1.234s)"),
+            "case",
+        )
+
+        score = score_test_results(
+            {"case [2.00 ms]": "PASSED"},
+            ["case [1.34 ms]"],
+            [],
+        )
+        self.assertEqual(score.reward, 1.0)
 
 
 if __name__ == "__main__":

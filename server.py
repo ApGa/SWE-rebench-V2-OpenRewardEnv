@@ -2,7 +2,6 @@
 import asyncio
 import base64
 import os
-import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,7 +12,7 @@ from openreward.environments.types import Blocks, JSONObject, TextBlock, ToolOut
 from pydantic import BaseModel, Field
 
 from dataset_store import TaskDataset
-from scoring import score_test_results
+from scoring import normalize_test_name, score_test_results
 from sandbox_backends import create_local_sandbox
 
 # ---------------------------------------------------------------------------
@@ -120,15 +119,6 @@ def _bounded_output(output: str) -> str:
     )
 
 
-# Same pattern as ANSI_ESCAPE_RE in log_parsers.py
-_ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-
-
-def _strip_ansi(s: str) -> str:
-    """Remove ANSI escape sequences from a string."""
-    return _ANSI_RE.sub("", s).strip()
-
-
 def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
@@ -199,8 +189,12 @@ class SWERebenchV2(Environment):
         if split != "train":
             raise ValueError(f"Unknown split: {split!r}")
         row = await asyncio.to_thread(_TASK_DATASET.get_task, index)
-        row["FAIL_TO_PASS"] = [_strip_ansi(t) for t in row["FAIL_TO_PASS"]]
-        row["PASS_TO_PASS"] = [_strip_ansi(t) for t in row["PASS_TO_PASS"]]
+        row["FAIL_TO_PASS"] = [
+            normalize_test_name(t) for t in row["FAIL_TO_PASS"]
+        ]
+        row["PASS_TO_PASS"] = [
+            normalize_test_name(t) for t in row["PASS_TO_PASS"]
+        ]
         return row
 
     # ----- lifecycle -----
@@ -393,7 +387,10 @@ class SWERebenchV2(Environment):
         parser_name = self.parsed.install_config.log_parser
         try:
             parser_fn = _get_log_parser(parser_name)
-            test_results = parser_fn(test_output)
+            test_results = {
+                normalize_test_name(test_id): status
+                for test_id, status in parser_fn(test_output).items()
+            }
         except Exception as e:
             return ToolOutput(
                 blocks=[TextBlock(text=f"Log parser error ({parser_name}): {e}\n\nRaw output:\n{test_output[:4000]}")],
