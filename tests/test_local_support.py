@@ -190,6 +190,11 @@ exit 2
                         f"{session_tmp}:/tmp",
                         sandbox._start_args("echo hello"),
                     )
+                    self.assertEqual(
+                        sandbox._start_args("echo hello")[-1],
+                        "export GIT_CONFIG_GLOBAL=/tmp/.gitconfig-openreward; "
+                        "echo hello",
+                    )
                     result = await sandbox.run("echo hello")
                     self.assertEqual(result.return_code, 0)
                     self.assertEqual(result.output, "fake command output")

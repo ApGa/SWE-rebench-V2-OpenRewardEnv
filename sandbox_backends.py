@@ -284,7 +284,15 @@ class EnrootSandbox:
         if self.session_tmp_dir is None:
             raise RuntimeError("Enroot sandbox session tmp has not been created")
         args += ["--mount", f"{self.session_tmp_dir}:/tmp"]
-        args += [self.name, "/bin/sh", "-lc", command]
+        # Enroot's standard configuration bind-mounts the host home directory
+        # into every container. Parallel SWE sessions would therefore make
+        # `git config --global` race on the same /root/.gitconfig.lock. Keep
+        # Git's global config in the already session-private /tmp mount and
+        # export the override for every command, including later agent tools.
+        isolated_command = (
+            "export GIT_CONFIG_GLOBAL=/tmp/.gitconfig-openreward; " + command
+        )
+        args += [self.name, "/bin/sh", "-lc", isolated_command]
         return args
 
     async def start(self) -> None:
