@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from task_commands import normalize_test_commands
+
 
 def build_index(data_dir: Path) -> dict:
     """Scan parquet files and return the index structure."""
@@ -46,8 +48,13 @@ def build_index(data_dir: Path) -> dict:
         ic = col[i].as_py()
         if isinstance(ic, str):
             ic = json.loads(ic)
-        if isinstance(ic, dict) and ic.get("test_cmd"):
-            valid_indices.append(i)
+        if not isinstance(ic, dict):
+            continue
+        try:
+            normalize_test_commands(ic.get("test_cmd"))
+        except ValueError:
+            continue
+        valid_indices.append(i)
     del table, col
 
     return {

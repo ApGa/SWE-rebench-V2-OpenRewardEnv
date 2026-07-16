@@ -14,7 +14,7 @@ from dataset_store import TaskDataset
 from sandbox_backends import EnrootSandbox, LocalRunResult, _enroot_import_uri
 
 
-def _task(instance_id: str, test_cmd: str) -> dict:
+def _task(instance_id: str, test_cmd: str | list[str]) -> dict:
     return {
         "instance_id": instance_id,
         "repo": "example/repo",
@@ -26,12 +26,14 @@ def _task(instance_id: str, test_cmd: str) -> dict:
         "language": "python",
         "FAIL_TO_PASS": ["test_bug"],
         "PASS_TO_PASS": ["test_existing"],
-        "install_config": {
-            "test_cmd": test_cmd,
-            "log_parser": "parse_pytest",
-            "install": "",
-            "base_image_name": "",
-        },
+        "install_config": json.dumps(
+            {
+                "test_cmd": test_cmd,
+                "log_parser": "parse_pytest",
+                "install": "",
+                "base_image_name": "",
+            }
+        ),
     }
 
 
@@ -48,7 +50,15 @@ class TaskDatasetTest(unittest.TestCase):
                 row_group_size=1,
             )
             pq.write_table(
-                pa.Table.from_pylist([_task("task-2", "go test ./...")]),
+                pa.Table.from_pylist(
+                    [
+                        _task(
+                            "task-2",
+                            ["go test ./...", "go test ./pkg/..."],
+                        ),
+                        _task("task-3", []),
+                    ]
+                ),
                 shards_dir / "part-1.parquet",
                 row_group_size=1,
             )

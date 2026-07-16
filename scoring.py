@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from log_parsers import TestStatus, ansi_escape

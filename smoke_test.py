@@ -12,6 +12,7 @@ from pathlib import Path
 from openreward.api.environments.types import TextBlock
 
 from dataset_store import TaskDataset
+from task_commands import build_test_command_script
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
@@ -140,10 +141,10 @@ if args.verbose:
             print("✗ Failed to apply test patch")
             ok = False
 
-        test_cmd = install_config["test_cmd"]
-        print(f"\n--- Running: {test_cmd} ---")
+        test_script = build_test_command_script(install_config["test_cmd"])
+        print(f"\n--- Running configured test command(s):\n{test_script} ---")
         result = session.call_tool("bash", {
-            "command": test_cmd,
+            "command": test_script,
             "description": "Run tests for diagnostic",
         })
         raw_output = _block_text(result)

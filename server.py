@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from dataset_store import TaskDataset
 from scoring import normalize_test_name, score_test_results
 from sandbox_backends import create_local_sandbox
+from task_commands import build_test_command_script
 
 # ---------------------------------------------------------------------------
 # Dataset loading — lazy row-group reads from one file or multiple shards
@@ -29,7 +30,7 @@ _TASK_DATASET = TaskDataset(DATA_DIR, index_path=TASK_INDEX)
 # ---------------------------------------------------------------------------
 
 class InstallConfig(BaseModel):
-    test_cmd: str
+    test_cmd: str | list[str]
     log_parser: str
     install: str | list[str] = ""
     base_image_name: str = ""
@@ -376,9 +377,11 @@ class SWERebenchV2(Environment):
                 )
 
         # 2. Run test command
-        test_cmd = self.parsed.install_config.test_cmd
+        test_script = build_test_command_script(
+            self.parsed.install_config.test_cmd
+        )
         res = await self.sandbox.run(
-            f"cd {_shell_quote(self.workdir)} && {test_cmd}",
+            f"cd {_shell_quote(self.workdir)} && {test_script}",
             timeout=float(os.getenv("SWE_TEST_TIMEOUT_SECONDS", "600")),
         )
         test_output, test_code = _result_values(res)
