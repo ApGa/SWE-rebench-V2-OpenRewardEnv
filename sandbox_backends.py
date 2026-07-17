@@ -273,13 +273,10 @@ class EnrootSandbox:
     def _start_args(self, command: str) -> list[str]:
         if self.session_tmp_dir is None:
             raise RuntimeError("Enroot sandbox session tmp has not been created")
-        rc_path = self.session_tmp_dir / ".openreward-enroot-rc"
         args = [
             "enroot",
             "start",
             "--rw",
-            "--rc",
-            str(rc_path),
         ]
         if self.root_remap:
             args.append("--root")
@@ -290,6 +287,13 @@ class EnrootSandbox:
             if mount:
                 args += ["--mount", mount]
 
+        # Enroot's generated /etc/rc establishes the image WORKDIR before it
+        # executes our explicit command. Image ENTRYPOINT logic lives in
+        # /etc/rc.local, so replace only that file with an empty session-local
+        # file: this preserves WORKDIR semantics without running a stale image
+        # entrypoint.
+        rc_local_path = self.session_tmp_dir / ".openreward-enroot-rc.local"
+        args += ["--mount", f"{rc_local_path}:/etc/rc.local"]
         args += ["--mount", f"{self.session_tmp_dir}:/tmp"]
         # Enroot's standard configuration bind-mounts the host home directory
         # into every container. Parallel SWE sessions would therefore make
@@ -317,15 +321,9 @@ class EnrootSandbox:
                 dir=tmp_root,
             )
         )
-        # Some benchmark images ship a stale Enroot/Docker entrypoint (for
-        # example, one that sources a missing /usr/local/cargo/env). Every task
-        # invocation already supplies an explicit shell command, so bypass the
-        # image rc with a session-private host script. Enroot resolves and
-        # copies --rc before applying container mounts, so --rc must receive
-        # this host path rather than the eventual /tmp path in the container.
-        rc_path = self.session_tmp_dir / ".openreward-enroot-rc"
-        rc_path.write_text("#!/bin/sh\nexec \"$@\"\n")
-        rc_path.chmod(0o700)
+        rc_local_path = self.session_tmp_dir / ".openreward-enroot-rc.local"
+        rc_local_path.write_text("")
+        rc_local_path.chmod(0o600)
         result = await _run_process(
             ["enroot", "create", "--name", self.name, str(image_path)],
             timeout=float(os.getenv("SWE_SANDBOX_CREATE_TIMEOUT_SECONDS", "1800")),

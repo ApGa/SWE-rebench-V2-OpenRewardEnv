@@ -167,17 +167,6 @@ case "$1" in
       printf 'unsafe ENROOT_MOUNT_HOME=%s' "${ENROOT_MOUNT_HOME-unset}"
       exit 3
     fi
-    shift
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--rc" ]; then
-        [ -f "$2" ] || {
-          printf 'missing host rc: %s' "$2"
-          exit 4
-        }
-        break
-      fi
-      shift
-    done
     printf 'fake command output'
     exit 0
     ;;
@@ -201,23 +190,28 @@ exit 2
                     self.assertIsNotNone(session_tmp)
                     assert session_tmp is not None
                     self.assertTrue(session_tmp.is_dir())
-                    rc_path = session_tmp / ".openreward-enroot-rc"
-                    self.assertEqual(rc_path.read_text(), '#!/bin/sh\nexec "$@"\n')
-                    self.assertEqual(rc_path.stat().st_mode & 0o777, 0o700)
+                    rc_local_path = (
+                        session_tmp / ".openreward-enroot-rc.local"
+                    )
+                    self.assertEqual(rc_local_path.read_text(), "")
+                    self.assertEqual(
+                        rc_local_path.stat().st_mode & 0o777,
+                        0o600,
+                    )
                     start_args = sandbox._start_args("echo hello")
-                    self.assertIn("--rc", start_args)
+                    self.assertNotIn("--rc", start_args)
                     self.assertNotIn("-lc", start_args)
                     self.assertEqual(start_args[-3:-1], ["/bin/sh", "-c"])
                     self.assertIn(
-                        str(rc_path),
-                        sandbox._start_args("echo hello"),
+                        f"{rc_local_path}:/etc/rc.local",
+                        start_args,
                     )
                     self.assertIn(
                         f"{session_tmp}:/tmp",
-                        sandbox._start_args("echo hello"),
+                        start_args,
                     )
                     self.assertEqual(
-                        sandbox._start_args("echo hello")[-1],
+                        start_args[-1],
                         "export GIT_CONFIG_GLOBAL=/tmp/.gitconfig-openreward; "
                         "echo hello",
                     )
