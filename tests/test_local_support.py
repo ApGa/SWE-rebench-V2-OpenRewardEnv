@@ -167,6 +167,17 @@ case "$1" in
       printf 'unsafe ENROOT_MOUNT_HOME=%s' "${ENROOT_MOUNT_HOME-unset}"
       exit 3
     fi
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--rc" ]; then
+        [ -f "$2" ] || {
+          printf 'missing host rc: %s' "$2"
+          exit 4
+        }
+        break
+      fi
+      shift
+    done
     printf 'fake command output'
     exit 0
     ;;
@@ -198,7 +209,7 @@ exit 2
                     self.assertNotIn("-lc", start_args)
                     self.assertEqual(start_args[-3:-1], ["/bin/sh", "-c"])
                     self.assertIn(
-                        "/tmp/.openreward-enroot-rc",
+                        str(rc_path),
                         sandbox._start_args("echo hello"),
                     )
                     self.assertIn(

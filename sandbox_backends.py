@@ -271,12 +271,15 @@ class EnrootSandbox:
                 tmp_path.unlink(missing_ok=True)
 
     def _start_args(self, command: str) -> list[str]:
+        if self.session_tmp_dir is None:
+            raise RuntimeError("Enroot sandbox session tmp has not been created")
+        rc_path = self.session_tmp_dir / ".openreward-enroot-rc"
         args = [
             "enroot",
             "start",
             "--rw",
             "--rc",
-            "/tmp/.openreward-enroot-rc",
+            str(rc_path),
         ]
         if self.root_remap:
             args.append("--root")
@@ -287,8 +290,6 @@ class EnrootSandbox:
             if mount:
                 args += ["--mount", mount]
 
-        if self.session_tmp_dir is None:
-            raise RuntimeError("Enroot sandbox session tmp has not been created")
         args += ["--mount", f"{self.session_tmp_dir}:/tmp"]
         # Enroot's standard configuration bind-mounts the host home directory
         # into every container. Parallel SWE sessions would therefore make
@@ -319,7 +320,9 @@ class EnrootSandbox:
         # Some benchmark images ship a stale Enroot/Docker entrypoint (for
         # example, one that sources a missing /usr/local/cargo/env). Every task
         # invocation already supplies an explicit shell command, so bypass the
-        # image rc with a session-private pass-through script mounted at /tmp.
+        # image rc with a session-private host script. Enroot resolves and
+        # copies --rc before applying container mounts, so --rc must receive
+        # this host path rather than the eventual /tmp path in the container.
         rc_path = self.session_tmp_dir / ".openreward-enroot-rc"
         rc_path.write_text("#!/bin/sh\nexec \"$@\"\n")
         rc_path.chmod(0o700)
