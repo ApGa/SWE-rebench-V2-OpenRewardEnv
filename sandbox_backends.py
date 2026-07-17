@@ -119,7 +119,7 @@ class DockerSandbox:
             "--entrypoint",
             "/bin/sh",
             self.image,
-            "-lc",
+            "-c",
             "trap 'exit 0' TERM INT; while :; do sleep 3600; done",
         ]
 
@@ -148,7 +148,7 @@ class DockerSandbox:
         if not self.started:
             raise RuntimeError("Docker sandbox has not been started")
         result = await _run_process(
-            ["docker", "exec", self.name, "/bin/sh", "-lc", command],
+            ["docker", "exec", self.name, "/bin/sh", "-c", command],
             timeout=self.default_timeout if timeout is None else timeout,
         )
         if result.return_code == 124:
@@ -271,7 +271,13 @@ class EnrootSandbox:
                 tmp_path.unlink(missing_ok=True)
 
     def _start_args(self, command: str) -> list[str]:
-        args = ["enroot", "start", "--rw"]
+        args = [
+            "enroot",
+            "start",
+            "--rw",
+            "--rc",
+            "/tmp/.openreward-enroot-rc",
+        ]
         if self.root_remap:
             args.append("--root")
 
@@ -292,7 +298,7 @@ class EnrootSandbox:
         isolated_command = (
             "export GIT_CONFIG_GLOBAL=/tmp/.gitconfig-openreward; " + command
         )
-        args += [self.name, "/bin/sh", "-lc", isolated_command]
+        args += [self.name, "/bin/sh", "-c", isolated_command]
         return args
 
     async def start(self) -> None:
@@ -310,6 +316,13 @@ class EnrootSandbox:
                 dir=tmp_root,
             )
         )
+        # Some benchmark images ship a stale Enroot/Docker entrypoint (for
+        # example, one that sources a missing /usr/local/cargo/env). Every task
+        # invocation already supplies an explicit shell command, so bypass the
+        # image rc with a session-private pass-through script mounted at /tmp.
+        rc_path = self.session_tmp_dir / ".openreward-enroot-rc"
+        rc_path.write_text("#!/bin/sh\nexec \"$@\"\n")
+        rc_path.chmod(0o700)
         result = await _run_process(
             ["enroot", "create", "--name", self.name, str(image_path)],
             timeout=float(os.getenv("SWE_SANDBOX_CREATE_TIMEOUT_SECONDS", "1800")),

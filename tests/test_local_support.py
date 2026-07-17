@@ -190,6 +190,17 @@ exit 2
                     self.assertIsNotNone(session_tmp)
                     assert session_tmp is not None
                     self.assertTrue(session_tmp.is_dir())
+                    rc_path = session_tmp / ".openreward-enroot-rc"
+                    self.assertEqual(rc_path.read_text(), '#!/bin/sh\nexec "$@"\n')
+                    self.assertEqual(rc_path.stat().st_mode & 0o777, 0o700)
+                    start_args = sandbox._start_args("echo hello")
+                    self.assertIn("--rc", start_args)
+                    self.assertNotIn("-lc", start_args)
+                    self.assertEqual(start_args[-3:-1], ["/bin/sh", "-c"])
+                    self.assertIn(
+                        "/tmp/.openreward-enroot-rc",
+                        sandbox._start_args("echo hello"),
+                    )
                     self.assertIn(
                         f"{session_tmp}:/tmp",
                         sandbox._start_args("echo hello"),
