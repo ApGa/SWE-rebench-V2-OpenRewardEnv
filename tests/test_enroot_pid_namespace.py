@@ -302,6 +302,67 @@ asyncio.run(main())
         output = self._run_outer_pid_one_probe(child_code)
         self.assertIn("leftovers=[]", output)
 
+    def test_owner_death_reaps_exact_zombie_adopted_by_outer_pid_one(self) -> None:
+        child_code = r'''
+import asyncio
+import os
+import tempfile
+from pathlib import Path
+
+from sandbox_backends import (
+    EnrootSandbox,
+    _process_state_and_start_time,
+    _process_state_parent_and_start_time,
+)
+
+
+async def main():
+    for iteration in range(16):
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = EnrootSandbox("owner-death-probe")
+            sandbox.namespace_control_dir = Path(tmp)
+            await sandbox._start_pid_namespace()
+            owner = sandbox._pid_namespace_process
+            anchor_pid = sandbox._pid_namespace_anchor_pid
+            anchor_start = sandbox._pid_namespace_anchor_start_time
+            assert owner is not None and anchor_pid is not None
+            assert anchor_start is not None
+
+            owner.kill()
+            if iteration % 2 == 0:
+                await owner.wait()
+                for _ in range(200):
+                    details = _process_state_parent_and_start_time(anchor_pid)
+                    if details is not None and details[0] == "Z":
+                        break
+                    await asyncio.sleep(0.01)
+                details = _process_state_parent_and_start_time(anchor_pid)
+                if details != ("Z", os.getpid(), anchor_start):
+                    raise RuntimeError(f"unexpected adopted init identity: {details}")
+            elif owner.returncode is not None:
+                raise RuntimeError(
+                    "owner-death race did not begin with returncode=None"
+                )
+
+            await sandbox._stop_pid_namespace()
+            if _process_state_and_start_time(anchor_pid) is not None:
+                raise RuntimeError(f"adopted init {anchor_pid} was not reaped")
+
+    leftovers = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit() and entry.name != "1":
+            if _process_state_and_start_time(int(entry.name)) is not None:
+                leftovers.append(entry.name)
+    print(f"leftovers={leftovers}", flush=True)
+    if leftovers:
+        raise RuntimeError(f"owner-death cleanup leaked processes: {leftovers}")
+
+
+asyncio.run(main())
+'''
+        output = self._run_outer_pid_one_probe(child_code)
+        self.assertIn("leftovers=[]", output)
+
     def test_partial_startup_cleanup_leaves_no_outer_pid_one_children(self) -> None:
         child_code = r'''
 import asyncio

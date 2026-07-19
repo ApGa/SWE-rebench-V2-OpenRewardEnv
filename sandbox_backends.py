@@ -194,6 +194,24 @@ def _process_identity_matches(pid: int, start_time: str) -> bool:
     return identity is not None and identity[1] == start_time
 
 
+def _process_state_parent_and_start_time(pid: int) -> tuple[str, int, str] | None:
+    """Return state, parent PID, and stable identity in one procfs read."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    command_end = stat.rfind(")")
+    if command_end < 0:
+        return None
+    fields = stat[command_end + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    try:
+        return fields[0], int(fields[1]), fields[19]
+    except ValueError:
+        return None
+
+
 def _process_pid_namespace_id(pid: int) -> int | None:
     try:
         lines = Path(f"/proc/{pid}/status").read_text().splitlines()
@@ -647,11 +665,36 @@ class EnrootSandbox:
         reaper_path.unlink(missing_ok=True)
         ready_path.unlink(missing_ok=True)
 
+    def _try_reap_adopted_namespace_init(
+        self,
+        pid: int,
+        start_time: str,
+    ) -> bool:
+        """Reap the exact recorded init if it is our adopted zombie."""
+        details = _process_state_parent_and_start_time(pid)
+        if details is None or details[2] != start_time:
+            return True
+        state, parent_pid, _ = details
+        if state != "Z" or parent_pid != os.getpid():
+            return False
+
+        # A zombie cannot recycle its PID before waitpid. The single procfs
+        # read above proves both the recorded start time and that this server
+        # is now its parent, so this cannot consume another asyncio child.
+        try:
+            waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return not _process_identity_matches(pid, start_time)
+        if waited_pid == pid:
+            return True
+        return not _process_identity_matches(pid, start_time)
+
     async def _stop_pid_namespace(self) -> None:
         process = self._pid_namespace_process
         anchor_pid = self._pid_namespace_anchor_pid
         anchor_identity = self._namespace_anchor_identity()
         teardown_identity: tuple[int, str] | None = None
+        signal_namespace_init = False
         stop_timeout = float(
             os.getenv("SWE_ENROOT_NAMESPACE_STOP_TIMEOUT_SECONDS", "10")
         )
@@ -659,10 +702,14 @@ class EnrootSandbox:
 
         if process is not None and process.returncode is None:
             if anchor_pid is not None and anchor_identity is not None:
-                if anchor_pid not in _direct_child_pids(process.pid):
-                    raise RuntimeError(
-                        "Enroot sandbox PID namespace owner no longer owns its init; "
-                        "refusing unsafe teardown"
+                if anchor_pid in _direct_child_pids(process.pid):
+                    signal_namespace_init = True
+                else:
+                    # The owner can exit before asyncio publishes returncode.
+                    # Never signal a reparented live process; exact-identity
+                    # verification below will reap it once waitable.
+                    self._try_reap_adopted_namespace_init(
+                        anchor_pid, anchor_identity[1]
                     )
                 teardown_identity = (anchor_pid, anchor_identity[1])
             elif anchor_pid is None:
@@ -680,6 +727,7 @@ class EnrootSandbox:
                         child_identity = _process_state_and_start_time(children[0])
                         if child_identity is not None:
                             teardown_identity = (children[0], child_identity[1])
+                            signal_namespace_init = True
                             break
                     if asyncio.get_running_loop().time() >= stop_deadline:
                         raise RuntimeError(
@@ -688,7 +736,7 @@ class EnrootSandbox:
                         )
                     await asyncio.sleep(0.01)
 
-            if teardown_identity is not None:
+            if teardown_identity is not None and signal_namespace_init:
                 teardown_pid, teardown_start_time = teardown_identity
                 identity = _process_state_and_start_time(teardown_pid)
                 if (
@@ -717,6 +765,13 @@ class EnrootSandbox:
             # Drain its diagnostic pipe after wait() has reaped the owner.
             await process.communicate()
 
+        if anchor_pid is not None and self._pid_namespace_anchor_start_time is not None:
+            # The owner can die between the direct-child check and wait(). Its
+            # Pdeath-killed init is then an exact zombie adopted by outer PID 1.
+            self._try_reap_adopted_namespace_init(
+                anchor_pid, self._pid_namespace_anchor_start_time
+            )
+
         identities_to_verify: list[tuple[int, str]] = []
         if teardown_identity is not None:
             identities_to_verify.append(teardown_identity)
@@ -726,10 +781,19 @@ class EnrootSandbox:
             )
 
         deadline = asyncio.get_running_loop().time() + 5
-        while any(
-            _process_identity_matches(pid, start_time)
-            for pid, start_time in identities_to_verify
-        ):
+        while True:
+            # Pdeath delivery can lag behind reaping the killed owner. Retry
+            # only the exact recorded identities until an adopted child
+            # reaches waitable zombie state.
+            for pid, start_time in identities_to_verify:
+                self._try_reap_adopted_namespace_init(pid, start_time)
+            remaining_identities = [
+                (pid, start_time)
+                for pid, start_time in identities_to_verify
+                if _process_identity_matches(pid, start_time)
+            ]
+            if not remaining_identities:
+                break
             if asyncio.get_running_loop().time() >= deadline:
                 raise RuntimeError(
                     "Enroot sandbox PID namespace init survived teardown or "
