@@ -188,6 +188,12 @@ def _process_state_and_start_time(pid: int) -> tuple[str, str] | None:
     return fields[0], fields[19]
 
 
+def _process_identity_matches(pid: int, start_time: str) -> bool:
+    """Return whether ``pid`` still names the same process, including zombies."""
+    identity = _process_state_and_start_time(pid)
+    return identity is not None and identity[1] == start_time
+
+
 def _process_pid_namespace_id(pid: int) -> int | None:
     try:
         lines = Path(f"/proc/{pid}/status").read_text().splitlines()
@@ -410,21 +416,26 @@ class EnrootSandbox:
             finally:
                 tmp_path.unlink(missing_ok=True)
 
-    def _namespace_anchor_identity_matches(self) -> bool:
+    def _namespace_anchor_identity(self) -> tuple[str, str] | None:
         anchor_pid = self._pid_namespace_anchor_pid
         expected_start_time = self._pid_namespace_anchor_start_time
         if anchor_pid is None or expected_start_time is None:
-            return False
+            return None
         process_identity = _process_state_and_start_time(anchor_pid)
-        return (
-            process_identity is not None
-            and process_identity[0] != "Z"
-            and process_identity[1] == expected_start_time
-        )
+        if process_identity is None or process_identity[1] != expected_start_time:
+            return None
+        return process_identity
+
+    def _namespace_anchor_identity_matches(self) -> bool:
+        # A zombie still occupies a PID and must remain visible to teardown.
+        # Treating it as gone lets an outer PID-namespace init accumulate one
+        # unreaped process per sandbox session.
+        return self._namespace_anchor_identity() is not None
 
     def _require_pid_namespace_anchor(self) -> None:
         process = self._pid_namespace_process
         anchor_pid = self._pid_namespace_anchor_pid
+        anchor_identity = self._namespace_anchor_identity()
         if self._stopping:
             raise RuntimeError(
                 "Enroot sandbox is stopping; refusing to start a command"
@@ -433,7 +444,8 @@ class EnrootSandbox:
             process is None
             or process.returncode is not None
             or anchor_pid is None
-            or not self._namespace_anchor_identity_matches()
+            or anchor_identity is None
+            or anchor_identity[0] == "Z"
             or anchor_pid not in _direct_child_pids(process.pid)
             or _process_pid_namespace_id(anchor_pid) != 1
             or _process_namespace_links(anchor_pid) != self._pid_namespace_links
@@ -575,12 +587,26 @@ class EnrootSandbox:
         launcher_path.chmod(0o600)
         reaper_path.chmod(0o600)
 
-        self._pid_namespace_process = await asyncio.create_subprocess_exec(
-            *self._namespace_launch_args(launcher_path, reaper_path, ready_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *self._namespace_launch_args(launcher_path, reaper_path, ready_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
         )
+        cancelled_during_spawn = False
+        while not spawn_task.done():
+            try:
+                await asyncio.shield(spawn_task)
+            except asyncio.CancelledError:
+                # asyncio may already have forked before create_subprocess_exec
+                # returns its handle. Let the spawn finish so ordered teardown
+                # can kill the namespace init before its unshare owner.
+                cancelled_during_spawn = True
+        self._pid_namespace_process = spawn_task.result()
+        if cancelled_during_spawn:
+            raise asyncio.CancelledError()
 
         startup_timeout = float(
             os.getenv("SWE_ENROOT_NAMESPACE_START_TIMEOUT_SECONDS", "15")
@@ -624,45 +650,99 @@ class EnrootSandbox:
     async def _stop_pid_namespace(self) -> None:
         process = self._pid_namespace_process
         anchor_pid = self._pid_namespace_anchor_pid
-        anchor_matches = self._namespace_anchor_identity_matches()
-        try:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+        anchor_identity = self._namespace_anchor_identity()
+        teardown_identity: tuple[int, str] | None = None
+        stop_timeout = float(
+            os.getenv("SWE_ENROOT_NAMESPACE_STOP_TIMEOUT_SECONDS", "10")
+        )
+        stop_deadline = asyncio.get_running_loop().time() + stop_timeout
 
-            # --kill-child=SIGKILL normally performs this teardown when the
-            # unshare owner dies. This identity-checked signal is a fallback
-            # for abrupt or partially failed launcher states.
-            if anchor_pid is not None and anchor_matches:
-                try:
-                    os.kill(anchor_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-            if process is not None:
-                try:
-                    await asyncio.wait_for(process.communicate(), timeout=10)
-                except asyncio.TimeoutError as error:
+        if process is not None and process.returncode is None:
+            if anchor_pid is not None and anchor_identity is not None:
+                if anchor_pid not in _direct_child_pids(process.pid):
                     raise RuntimeError(
-                        "Timed out while stopping Enroot sandbox PID namespace"
-                    ) from error
-
-            deadline = asyncio.get_running_loop().time() + 5
-            while self._namespace_anchor_identity_matches():
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError(
-                        "Enroot sandbox PID namespace anchor survived teardown"
+                        "Enroot sandbox PID namespace owner no longer owns its init; "
+                        "refusing unsafe teardown"
                     )
-                await asyncio.sleep(0.05)
-        finally:
-            self._pid_namespace_process = None
-            self._pid_namespace_anchor_pid = None
-            self._pid_namespace_anchor_start_time = None
-            self._pid_namespace_links = None
-            self._unshare_path = None
-            self._nsenter_path = None
+                teardown_identity = (anchor_pid, anchor_identity[1])
+            elif anchor_pid is None:
+                # Startup cancellation can arrive before the ready handshake
+                # records the init. Wait for the launcher to fork so teardown
+                # can still kill the child first and let unshare reap it.
+                while process.returncode is None:
+                    children = _direct_child_pids(process.pid)
+                    if len(children) > 1:
+                        raise RuntimeError(
+                            "Enroot sandbox PID namespace owner has an unexpected "
+                            f"process tree: {children}"
+                        )
+                    if children:
+                        child_identity = _process_state_and_start_time(children[0])
+                        if child_identity is not None:
+                            teardown_identity = (children[0], child_identity[1])
+                            break
+                    if asyncio.get_running_loop().time() >= stop_deadline:
+                        raise RuntimeError(
+                            "Timed out while waiting for the Enroot sandbox PID "
+                            "namespace owner to create its init during cleanup"
+                        )
+                    await asyncio.sleep(0.01)
+
+            if teardown_identity is not None:
+                teardown_pid, teardown_start_time = teardown_identity
+                identity = _process_state_and_start_time(teardown_pid)
+                if (
+                    identity is not None
+                    and identity[1] == teardown_start_time
+                    and identity[0] != "Z"
+                ):
+                    try:
+                        os.kill(teardown_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            # Do not kill the unshare owner first. It is the only process able
+            # to wait(2) its PID-namespace init; killing it first reparents a
+            # zombie to the production server when that server is outer PID 1.
+            try:
+                remaining = max(0.0, stop_deadline - asyncio.get_running_loop().time())
+                await asyncio.wait_for(process.wait(), timeout=remaining)
+            except asyncio.TimeoutError as error:
+                raise RuntimeError(
+                    "Timed out while waiting for the Enroot sandbox PID "
+                    "namespace owner to reap its init"
+                ) from error
+
+        if process is not None:
+            # Drain its diagnostic pipe after wait() has reaped the owner.
+            await process.communicate()
+
+        identities_to_verify: list[tuple[int, str]] = []
+        if teardown_identity is not None:
+            identities_to_verify.append(teardown_identity)
+        if anchor_pid is not None and self._pid_namespace_anchor_start_time is not None:
+            identities_to_verify.append(
+                (anchor_pid, self._pid_namespace_anchor_start_time)
+            )
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while any(
+            _process_identity_matches(pid, start_time)
+            for pid, start_time in identities_to_verify
+        ):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    "Enroot sandbox PID namespace init survived teardown or "
+                    "remained as a zombie"
+                )
+            await asyncio.sleep(0.05)
+
+        self._pid_namespace_process = None
+        self._pid_namespace_anchor_pid = None
+        self._pid_namespace_anchor_start_time = None
+        self._pid_namespace_links = None
+        self._unshare_path = None
+        self._nsenter_path = None
 
     def _start_args(self, command: str) -> list[str]:
         if self.session_tmp_dir is None:
@@ -793,20 +873,32 @@ class EnrootSandbox:
             entered_marker.unlink(missing_ok=True)
 
     async def _cleanup_resources(self) -> None:
-        errors: list[Exception] = []
         try:
             await self._stop_pid_namespace()
         except Exception as error:
-            errors.append(error)
+            # The namespace must be gone before touching the writable rootfs.
+            # Preserve all ownership state so a subsequent stop() can retry.
+            self.started = False
+            raise RuntimeError(
+                f"Enroot sandbox namespace cleanup failed: {error}"
+            ) from error
 
         if self._container_created:
             try:
-                await _run_process(
+                result = await _run_process(
                     ["enroot", "remove", "-f", self.name],
                     timeout=120,
                 )
             except Exception as error:
-                errors.append(error)
+                self.started = False
+                raise RuntimeError(
+                    f"Enroot sandbox removal failed: {error}"
+                ) from error
+            if result.return_code != 0:
+                self.started = False
+                raise RuntimeError(
+                    "Enroot sandbox removal failed: " + result.output.strip()
+                )
 
         if self.session_tmp_dir is not None:
             shutil.rmtree(self.session_tmp_dir, ignore_errors=True)
@@ -817,10 +909,6 @@ class EnrootSandbox:
         self._container_created = False
         self.started = False
         self._stopping = False
-
-        if errors:
-            details = "; ".join(str(error) for error in errors)
-            raise RuntimeError(f"Enroot sandbox cleanup failed: {details}")
 
     async def stop(self) -> None:
         if self._stop_task is None or self._stop_task.done():

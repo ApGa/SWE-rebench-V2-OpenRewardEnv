@@ -229,6 +229,196 @@ class EnrootNamespaceIntegrationTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def _run_outer_pid_one_probe(
+        self,
+        child_code: str,
+        *,
+        timeout: float = 45,
+    ) -> str:
+        unshare = shutil.which("unshare")
+        assert unshare is not None
+        completed = subprocess.run(
+            [
+                unshare,
+                "--user",
+                "--map-current-user",
+                "--pid",
+                "--fork",
+                "--kill-child=SIGKILL",
+                "--mount-proc",
+                "--",
+                sys.executable,
+                "-c",
+                child_code,
+            ],
+            cwd=Path(__file__).resolve().parent.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if completed.returncode != 0 and "Operation not permitted" in completed.stdout:
+            self.skipTest(completed.stdout.strip())
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        return completed.stdout
+
+    def test_repeated_teardown_leaves_no_zombies_for_outer_pid_one(self) -> None:
+        child_code = r'''
+import asyncio
+import tempfile
+from pathlib import Path
+
+from sandbox_backends import EnrootSandbox, _process_state_and_start_time
+
+
+def remaining_processes():
+    result = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or entry.name == "1":
+            continue
+        identity = _process_state_and_start_time(int(entry.name))
+        if identity is not None:
+            result.append((entry.name, identity[0]))
+    return result
+
+
+async def main():
+    for _ in range(16):
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = EnrootSandbox("outer-pid-one-probe")
+            sandbox.namespace_control_dir = Path(tmp)
+            await sandbox._start_pid_namespace()
+            await sandbox._stop_pid_namespace()
+
+    leftovers = remaining_processes()
+    print(f"leftovers={leftovers}", flush=True)
+    if leftovers:
+        raise RuntimeError(f"namespace teardown leaked processes: {leftovers}")
+
+
+asyncio.run(main())
+'''
+        output = self._run_outer_pid_one_probe(child_code)
+        self.assertIn("leftovers=[]", output)
+
+    def test_partial_startup_cleanup_leaves_no_outer_pid_one_children(self) -> None:
+        child_code = r'''
+import asyncio
+import os
+import tempfile
+from pathlib import Path
+
+import sandbox_backends
+from sandbox_backends import EnrootSandbox, _process_state_and_start_time
+
+
+def remaining_processes():
+    result = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or entry.name == "1":
+            continue
+        identity = _process_state_and_start_time(int(entry.name))
+        if identity is not None:
+            result.append((entry.name, identity[0]))
+    return result
+
+
+async def ready_timeout_cycle():
+    with tempfile.TemporaryDirectory() as tmp:
+        sandbox = EnrootSandbox("ready-timeout-probe")
+        sandbox.namespace_control_dir = Path(tmp)
+        try:
+            await sandbox._start_pid_namespace()
+        except RuntimeError as error:
+            if "Timed out" not in str(error):
+                raise
+        else:
+            raise RuntimeError("namespace unexpectedly reached its ready handshake")
+        finally:
+            await sandbox._stop_pid_namespace()
+
+
+async def cancelled_start_cycle():
+    with tempfile.TemporaryDirectory() as tmp:
+        sandbox = EnrootSandbox("cancelled-start-probe")
+        sandbox.namespace_control_dir = Path(tmp)
+
+        async def block_ready(_ready_path, _timeout):
+            await asyncio.Event().wait()
+
+        sandbox._wait_for_pid_namespace_anchor = block_ready
+        start_task = asyncio.create_task(sandbox._start_pid_namespace())
+        while sandbox._pid_namespace_process is None:
+            await asyncio.sleep(0)
+        start_task.cancel()
+        try:
+            await start_task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise RuntimeError("cancelled namespace startup unexpectedly completed")
+        await sandbox._stop_pid_namespace()
+
+
+async def cancelled_spawn_delivery_cycle():
+    with tempfile.TemporaryDirectory() as tmp:
+        sandbox = EnrootSandbox("cancelled-spawn-delivery-probe")
+        sandbox.namespace_control_dir = Path(tmp)
+        real_create_subprocess_exec = asyncio.create_subprocess_exec
+        spawned = asyncio.Event()
+        release_handle = asyncio.Event()
+
+        async def delayed_handle_delivery(*args, **kwargs):
+            process = await real_create_subprocess_exec(*args, **kwargs)
+            spawned.set()
+            await release_handle.wait()
+            return process
+
+        asyncio.create_subprocess_exec = delayed_handle_delivery
+        try:
+            start_task = asyncio.create_task(sandbox._start_pid_namespace())
+            await spawned.wait()
+            start_task.cancel()
+            await asyncio.sleep(0)
+            release_handle.set()
+            try:
+                await start_task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise RuntimeError(
+                    "startup cancelled after fork unexpectedly completed"
+                )
+        finally:
+            asyncio.create_subprocess_exec = real_create_subprocess_exec
+
+        if sandbox._pid_namespace_process is None:
+            raise RuntimeError("forked namespace owner handle was lost")
+        await sandbox._stop_pid_namespace()
+
+
+async def main():
+    os.environ["SWE_ENROOT_NAMESPACE_START_TIMEOUT_SECONDS"] = "0.05"
+    sandbox_backends._PID_NAMESPACE_REAPER = "import time; time.sleep(60)\n"
+    for _ in range(4):
+        await ready_timeout_cycle()
+    for _ in range(16):
+        await cancelled_start_cycle()
+    for _ in range(8):
+        await cancelled_spawn_delivery_cycle()
+
+    leftovers = remaining_processes()
+    print(f"leftovers={leftovers}", flush=True)
+    if leftovers:
+        raise RuntimeError(f"partial startup cleanup leaked processes: {leftovers}")
+
+
+asyncio.run(main())
+'''
+        output = self._run_outer_pid_one_probe(child_code, timeout=60)
+        self.assertIn("leftovers=[]", output)
+
     def test_anchor_persists_background_process_and_ignores_term_signals(
         self,
     ) -> None:
