@@ -102,6 +102,13 @@ containers from inside it requires nested user/mount namespaces and is not
 portable across HPC configurations. Running the lightweight Python server on
 the host avoids this nesting while task execution remains containerized.
 
+Each Enroot session also owns a persistent user, mount, and PID namespace.
+Commands enter it with `nsenter`, so background services survive between tool
+calls while processes from other sessions and host Slurm steps are invisible.
+The host must provide util-linux `unshare` and `nsenter` and permit unprivileged
+user namespaces; session startup fails closed when these capabilities are not
+available.
+
 Enroot uses host networking. Unlike the Docker backend, it cannot enforce
 `--network none`; use cluster-level egress controls when task network
 isolation is required.
@@ -128,6 +135,8 @@ The server port can be set with `OPENREWARD_PORT` (preferred) or `PORT`.
 - `SWE_ENROOT_SESSION_TMP_ROOT`: parent directory for per-session `/tmp`
   bind mounts. Defaults to the system temporary directory; use node-local
   storage for production rollouts.
+- `SWE_ENROOT_NAMESPACE_START_TIMEOUT_SECONDS`: namespace anchor startup and
+  verification timeout; default 15.
 - `SWE_ENROOT_ROOT_REMAP`: pass `--root` to Enroot; enabled by default.
 - `SWE_ENROOT_MOUNTS`: semicolon-separated Enroot mounts such as
   `/scratch:/scratch;/datasets:/datasets`.
