@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -122,6 +123,7 @@ class SandboxBackend(Protocol):
         self,
         command: str,
         timeout: float | None = None,
+        stdin_data: bytes | None = None,
     ) -> LocalRunResult: ...
 
     async def stop(self) -> None: ...
@@ -132,17 +134,27 @@ async def _run_process(
     *,
     timeout: float | None = None,
     env: dict[str, str] | None = None,
+    stdin_data: bytes | None = None,
 ) -> LocalRunResult:
-    """Run a host command and terminate its process group if interrupted."""
+    """Run a host command and terminate its process group if interrupted.
+
+    ``stdin_data`` is passed through a pipe instead of being embedded in
+    ``args``. This matters for source files and patches, which can readily
+    exceed the host's argv size limit.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=env,
         start_new_session=True,
     )
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(input=stdin_data),
+            timeout=timeout,
+        )
         return LocalRunResult(
             output=stdout.decode(errors="replace"),
             return_code=proc.returncode or 0,
@@ -247,7 +259,7 @@ class DockerSandbox:
     """A persistent writable task container managed by a local Docker daemon."""
 
     def __init__(self, image: str) -> None:
-        self.image = image
+        self.image = local_image_reference(image)
         self.name = f"swe-rebench-{uuid4().hex[:16]}"
         self.default_timeout = float(
             os.getenv("SWE_SANDBOX_COMMAND_TIMEOUT_SECONDS", "600")
@@ -299,12 +311,18 @@ class DockerSandbox:
         self,
         command: str,
         timeout: float | None = None,
+        stdin_data: bytes | None = None,
     ) -> LocalRunResult:
         if not self.started:
             raise RuntimeError("Docker sandbox has not been started")
+        exec_args = ["docker", "exec"]
+        if stdin_data is not None:
+            exec_args.append("-i")
+        exec_args += [self.name, "/bin/sh", "-c", command]
         result = await _run_process(
-            ["docker", "exec", self.name, "/bin/sh", "-c", command],
+            exec_args,
             timeout=self.default_timeout if timeout is None else timeout,
+            stdin_data=stdin_data,
         )
         if result.return_code == 124:
             # Killing docker exec does not reliably kill its process in the
@@ -327,9 +345,28 @@ class DockerSandbox:
 _DOCKER_HUB_REGISTRIES = frozenset(
     {"docker.io", "index.docker.io", "registry-1.docker.io"}
 )
+_PRIME_SWE_IMAGE_PREFIX = "prime/primeintellect/"
+
+
+def local_image_reference(image: str) -> str:
+    """Translate Prime sandbox image IDs back to their public OCI source.
+
+    PrimeIntellect's verified SWE-rebench subset preserves upstream task data
+    but rewrites ``docker.io/swerebenchv2/...`` image names for Prime's sandbox
+    registry. Docker and Enroot need the original OCI reference. Reversing that
+    documented prefix rewrite also preserves compatibility with existing SQSH
+    cache keys.
+    """
+    if image.startswith(_PRIME_SWE_IMAGE_PREFIX):
+        return (
+            "docker.io/swerebenchv2/"
+            + image.removeprefix(_PRIME_SWE_IMAGE_PREFIX)
+        )
+    return image
 
 
 def _enroot_import_uri(image: str) -> str:
+    image = local_image_reference(image)
     if image.startswith(("dockerd://", "podman://")):
         return image
     if image.startswith("docker://"):
@@ -353,11 +390,28 @@ def _enroot_import_uri(image: str) -> str:
     return f"docker://{image}"
 
 
+def _enroot_import_environment() -> dict[str, str]:
+    """Return an import environment safe for read-only layer directories.
+
+    Enroot 3.5 extracts each OCI layer with GNU tar. Some task images contain
+    interleaved archive members which revisit a directory after its read-only
+    mode has already been restored. Delaying all directory metadata restoration
+    until the end of extraction prevents those later members from failing with
+    ``Permission denied``.
+    """
+    env = dict(os.environ)
+    tar_options = env.get("TAR_OPTIONS", "").split()
+    if "--delay-directory-restore" not in tar_options:
+        tar_options.append("--delay-directory-restore")
+    env["TAR_OPTIONS"] = " ".join(tar_options)
+    return env
+
+
 class EnrootSandbox:
     """A persistent writable task sandbox backed by host Enroot."""
 
     def __init__(self, image: str) -> None:
-        self.image = image
+        self.image = local_image_reference(image)
         self.name = f"swe-rebench-{uuid4().hex[:16]}"
         cache_default = (
             Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -408,29 +462,76 @@ class EnrootSandbox:
             tmp_path.unlink(missing_ok=True)
 
             try:
-                result = subprocess.run(
-                    [
-                        "enroot",
-                        "import",
-                        "--output",
-                        str(tmp_path),
-                        _enroot_import_uri(self.image),
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=float(
-                        os.getenv("SWE_SANDBOX_CREATE_TIMEOUT_SECONDS", "1800")
-                    ),
-                    check=False,
+                attempts = max(
+                    1, int(os.getenv("SWE_ENROOT_IMPORT_ATTEMPTS", "3"))
                 )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"enroot import failed for {self.image}: "
-                        f"{result.stdout.strip()}"
+                retry_delay = max(
+                    0.0,
+                    float(
+                        os.getenv(
+                            "SWE_ENROOT_IMPORT_RETRY_DELAY_SECONDS",
+                            "2",
+                        )
+                    ),
+                )
+                timeout = float(
+                    os.getenv(
+                        "SWE_ENROOT_IMPORT_TIMEOUT_SECONDS",
+                        os.getenv(
+                            "SWE_SANDBOX_CREATE_TIMEOUT_SECONDS",
+                            "1800",
+                        ),
                     )
-                os.replace(tmp_path, image_path)
-                return image_path
+                )
+                errors: list[str] = []
+                for attempt in range(1, attempts + 1):
+                    tmp_path.unlink(missing_ok=True)
+                    try:
+                        result = subprocess.run(
+                            [
+                                "enroot",
+                                "import",
+                                "--output",
+                                str(tmp_path),
+                                _enroot_import_uri(self.image),
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=timeout,
+                            check=False,
+                            env=_enroot_import_environment(),
+                        )
+                    except subprocess.TimeoutExpired as error:
+                        errors.append(
+                            f"attempt {attempt}/{attempts} timed out after "
+                            f"{timeout:g}s: {error.stdout or ''}".strip()
+                        )
+                    else:
+                        if (
+                            result.returncode == 0
+                            and tmp_path.exists()
+                            and tmp_path.stat().st_size > 0
+                        ):
+                            os.replace(tmp_path, image_path)
+                            return image_path
+                        detail = result.stdout.strip()
+                        if result.returncode == 0:
+                            detail = (
+                                detail + "\n" if detail else ""
+                            ) + "enroot import produced no image data"
+                        errors.append(
+                            f"attempt {attempt}/{attempts} exited "
+                            f"{result.returncode}: {detail}"
+                        )
+
+                    if attempt < attempts and retry_delay:
+                        time.sleep(retry_delay)
+
+                raise RuntimeError(
+                    f"enroot import failed for {self.image} after "
+                    f"{attempts} attempt(s):\n" + "\n".join(errors)
+                )
             finally:
                 tmp_path.unlink(missing_ok=True)
 
@@ -900,6 +1001,7 @@ class EnrootSandbox:
         self,
         command: str,
         timeout: float | None = None,
+        stdin_data: bytes | None = None,
     ) -> LocalRunResult:
         if not self.started:
             raise RuntimeError("Enroot sandbox has not been started")
@@ -917,6 +1019,7 @@ class EnrootSandbox:
                     # explicit empty value disables the hook even when the
                     # parent environment sets ENROOT_MOUNT_HOME.
                     env={**os.environ, "ENROOT_MOUNT_HOME": ""},
+                    stdin_data=stdin_data,
                 )
             except (FileNotFoundError, PermissionError, OSError) as error:
                 raise RuntimeError(

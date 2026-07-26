@@ -23,17 +23,26 @@ uv pip install -r requirements.txt
 ### 2. Download and index the dataset
 
 The server image intentionally does not contain the multi-gigabyte dataset.
-Download the Hugging Face parquet shards to persistent storage:
+For RL training, the recommended source is PrimeIntellect's filtered subset:
+6,272 tasks that pass repeated gold-patch validation, exclude no-edit solves
+and known flaky/broken images, and retain the upstream row schema.
 
 ```bash
-export DATA_DIR="$HOME/data/SWE-rebench-V2"
-uvx --from huggingface-hub hf download nebius/SWE-rebench-V2 \
+export DATA_DIR="$HOME/data/SWE-rebench-V2-Filtered-Verified"
+uvx --from huggingface-hub hf download \
+  PrimeIntellect/SWE-rebench-V2-Filtered-Verified \
   --repo-type dataset \
   --local-dir "$DATA_DIR" \
   --include 'data/*.parquet'
 
 .venv/bin/python build_index.py --data-dir "$DATA_DIR"
 ```
+
+The original 32,079-row `nebius/SWE-rebench-V2` dataset remains schema
+compatible and can be used when broad coverage is more important than verified
+reward correctness. Prime image identifiers are translated back to the
+corresponding upstream OCI references only for local Docker/Enroot execution;
+hosted Prime sandbox identifiers are left unchanged.
 
 The index excludes rows without a test command and lets the server read one
 parquet row group at a time instead of loading roughly 2 GB into each server
@@ -131,7 +140,18 @@ The server port can be set with `OPENREWARD_PORT` (preferred) or `PORT`.
 - `SWE_TEST_TIMEOUT_SECONDS`: submission test timeout; default 600.
 - `SWE_SANDBOX_CREATE_TIMEOUT_SECONDS`: image import/create timeout; default 1800.
 - `SWE_TOOL_OUTPUT_MAX_CHARS`: maximum returned command output; default 50000.
+- `SWE_GRADER_RAW_OUTPUT_MAX_CHARS`: bounded raw test output retained in each
+  submission result; default 20000.
+- `SWE_GRADER_DIAGNOSTIC_MAX_CHARS`: bounded pre-submission Git status, diff
+  stat, and fingerprint output; default 12000.
+- `SWE_GRADER_EXPECTED_DETAIL_LIMIT`: maximum individual expected-test status
+  lines retained per category; default 200.
 - `SWE_ENROOT_IMAGE_CACHE`: squashfs cache location.
+- `SWE_ENROOT_IMPORT_ATTEMPTS`: lazy-image import attempts; default 3.
+- `SWE_ENROOT_IMPORT_RETRY_DELAY_SECONDS`: delay between import attempts;
+  default 2.
+- `SWE_ENROOT_IMPORT_TIMEOUT_SECONDS`: timeout for each image import; defaults
+  to `SWE_SANDBOX_CREATE_TIMEOUT_SECONDS`.
 - `SWE_ENROOT_SESSION_TMP_ROOT`: parent directory for per-session `/tmp`
   bind mounts. Defaults to the system temporary directory; use node-local
   storage for production rollouts.
@@ -141,6 +161,43 @@ The server port can be set with `OPENREWARD_PORT` (preferred) or `PORT`.
 - `SWE_ENROOT_MOUNTS`: semicolon-separated Enroot mounts such as
   `/scratch:/scratch;/datasets:/datasets`.
 - `SWE_DOCKER_CPUS` and `SWE_DOCKER_MEMORY`: optional task-container limits.
+
+## Dataset preflight
+
+`preflight.py` has two validation modes. Metadata mode checks every indexed
+task's command, parser, patches, image reference, and expected-test labels
+without starting containers:
+
+```bash
+.venv-openreward/bin/python preflight.py \
+  --data-dir "$DATA_DIR" \
+  --mode metadata \
+  --output metadata.jsonl
+```
+
+Execution mode starts clean task images twice. The base phase applies only the
+held-out test patch and requires every F2P test to be observed failing while
+P2P passes. The gold phase applies the gold and held-out patches and requires
+every expected test to be parsed and pass:
+
+```bash
+.venv-openreward/bin/python preflight.py \
+  --data-dir "$DATA_DIR" \
+  --mode execute \
+  --indices 12,90,400-410 \
+  --output execution.jsonl
+```
+
+The Platoon checkout includes a sharded CPU launcher at
+`slurm-scripts/openreward-swe-rebench-preflight.sh`. A full execution scan is
+deliberately not the default: the verified set still has 6,272 unique
+multi-GB images (roughly 18 TiB if all were retained), while the original set
+would require roughly 90 TiB. Full scans use a dedicated node-local cache and
+delete each SQSH after its task. Small targeted scans can set
+`SWE_PREFLIGHT_RETAIN_IMAGES=1` to populate the training cache. For a bounded
+cross-language audit, set `SWE_PREFLIGHT_SAMPLE_PER_LANGUAGE`; add
+`SWE_PREFLIGHT_CACHED_ONLY=1` to reuse only images already in the training
+cache.
 
 ## Community
 

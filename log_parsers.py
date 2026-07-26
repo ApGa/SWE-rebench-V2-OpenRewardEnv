@@ -2313,7 +2313,7 @@ def parse_log_js_4(log: str) -> dict[str, str]:
     results: dict[str, str] = {}
     mult_sign = chr(0x00D7)
     pass_symbols = ("✔", "✓")
-    fail_symbols = ("✘", "✖", mult_sign)
+    fail_symbols = ("✘", "✖", "✕", mult_sign)
     skip_symbols = ("○", "◌", "◦", "⚪")
     skip_markers = ("(skipped)", "[skip]", "[skipped]", "[pending]", "[todo]")
 

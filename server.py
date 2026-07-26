@@ -4,6 +4,7 @@ import base64
 import os
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from openreward import AsyncOpenReward, SandboxSettings
 from openreward.api.sandboxes.types import MachineSize
@@ -91,8 +92,82 @@ class CreateFileInput(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _text_output(text: str, finished: bool = False) -> ToolOutput:
-    return ToolOutput(blocks=[TextBlock(text=text)], finished=finished)
+def _text_output(
+    text: str,
+    finished: bool = False,
+    *,
+    metadata: JSONObject | None = None,
+    reward: float | None = None,
+) -> ToolOutput:
+    return ToolOutput(
+        blocks=[TextBlock(text=text)],
+        finished=finished,
+        metadata=metadata,
+        reward=reward,
+    )
+
+
+def _command_output(
+    text: str,
+    exit_code: int,
+    *,
+    finished: bool = False,
+    reward: float | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> ToolOutput:
+    metadata: dict[str, Any] = {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return _text_output(
+        f"{text}\nExit code: {exit_code}",
+        finished,
+        metadata=metadata,
+        reward=reward,
+    )
+
+
+def _tool_error(
+    tool_name: str,
+    error: BaseException | str,
+    *,
+    finished: bool = False,
+    reward: float | None = None,
+    invalid: bool = False,
+) -> ToolOutput:
+    if isinstance(error, BaseException):
+        error_type = type(error).__name__
+        message = str(error) or repr(error)
+    else:
+        error_type = "ToolError"
+        message = error
+    metadata: dict[str, Any] = {
+        "ok": False,
+        "tool": tool_name,
+        "error_type": error_type,
+        "error": message,
+        "exit_code": 1,
+    }
+    if invalid:
+        metadata.update(
+            {
+                "invalid": True,
+                "failure_class": "infrastructure",
+            }
+        )
+    return _text_output(
+        (
+            f"Tool error: {tool_name}\n"
+            f"Error type: {error_type}\n"
+            f"Message: {message}\n"
+            "Exit code: 1"
+        ),
+        finished,
+        metadata=metadata,
+        reward=reward,
+    )
 
 
 def _result_values(result: Any) -> tuple[str, int]:
@@ -106,8 +181,9 @@ def _result_values(result: Any) -> tuple[str, int]:
     return str(output), int(return_code)
 
 
-def _bounded_output(output: str) -> str:
-    max_chars = int(os.getenv("SWE_TOOL_OUTPUT_MAX_CHARS", "50000"))
+def _bounded_text(output: str, max_chars: int, *, label: str) -> str:
+    if max_chars < 1:
+        return ""
     if len(output) <= max_chars:
         return output
     omitted = len(output) - max_chars
@@ -115,9 +191,48 @@ def _bounded_output(output: str) -> str:
     end_chars = max_chars - start_chars
     return (
         output[:start_chars]
-        + f"\n\n... [truncated {omitted} characters] ...\n\n"
+        + f"\n\n... [{label}: {omitted} characters omitted] ...\n\n"
         + output[-end_chars:]
     )
+
+
+def _bounded_output(output: str) -> str:
+    return _bounded_text(
+        output,
+        int(os.getenv("SWE_TOOL_OUTPUT_MAX_CHARS", "50000")),
+        label="tool output truncated",
+    )
+
+
+def _status_detail(
+    test_ids: list[str],
+    test_results: dict[str, str],
+    *,
+    only_nonpassing: bool,
+) -> tuple[list[str], int]:
+    """Return a bounded status listing and its unabridged item count."""
+    entries = [
+        (
+            test_id,
+            test_results.get(normalize_test_name(test_id), "NOT_FOUND"),
+        )
+        for test_id in test_ids
+    ]
+    if only_nonpassing:
+        entries = [
+            (test_id, status)
+            for test_id, status in entries
+            if status != "PASSED"
+        ]
+    total = len(entries)
+    limit = max(
+        0,
+        int(os.getenv("SWE_GRADER_EXPECTED_DETAIL_LIMIT", "200")),
+    )
+    lines = [f"  {test_id}: {status}" for test_id, status in entries[:limit]]
+    if total > limit:
+        lines.append(f"  ... {total - limit} additional result(s) omitted")
+    return lines, total
 
 
 def _shell_quote(s: str) -> str:
@@ -262,118 +377,443 @@ class SWERebenchV2(Environment):
         )
         return [TextBlock(text=text)]
 
+    async def _stage_text_file(self, content: str) -> str:
+        """Write content to a private sandbox file without placing it in argv.
+
+        Local Docker and Enroot backends have a real stdin pipe. The hosted
+        OpenReward API does not currently expose stdin, so use bounded chunks
+        whose individual command arguments remain safely below ARG_MAX.
+        """
+        sandbox_path = f"/tmp/.openreward-upload-{uuid4().hex}"
+        encoded = content.encode("utf-8")
+
+        if self.or_client is None:
+            result = await self.sandbox.run(
+                f"umask 077; cat > {_shell_quote(sandbox_path)}",
+                stdin_data=encoded,
+            )
+            output, exit_code = _result_values(result)
+            if exit_code != 0:
+                detail = output.strip() or "(no output)"
+                raise RuntimeError(
+                    f"Could not stage file in sandbox (exit {exit_code}): "
+                    f"{detail}"
+                )
+            return sandbox_path
+
+        # OpenReward 0.1.137's upload helper embeds the complete file in one
+        # command and therefore has the same ARG_MAX failure mode. Hosted
+        # sandboxes do not expose stdin yet, so append bounded base64 chunks.
+        # 32 KiB of raw input yields a command under 44 KiB.
+        chunk_size = 32 * 1024
+        try:
+            initialize = await self.sandbox.run(
+                f"umask 077; : > {_shell_quote(sandbox_path)}"
+            )
+            initialize_output, initialize_code = _result_values(initialize)
+            if initialize_code != 0:
+                raise RuntimeError(
+                    "Could not initialize hosted sandbox staging file "
+                    f"(exit {initialize_code}): "
+                    f"{initialize_output.strip() or '(no output)'}"
+                )
+
+            for offset in range(0, len(encoded), chunk_size):
+                chunk = base64.b64encode(
+                    encoded[offset : offset + chunk_size]
+                ).decode("ascii")
+                append = await self.sandbox.run(
+                    f"printf '%s' {_shell_quote(chunk)} | base64 -d >> "
+                    f"{_shell_quote(sandbox_path)}"
+                )
+                append_output, append_code = _result_values(append)
+                if append_code != 0:
+                    raise RuntimeError(
+                        "Could not append hosted sandbox staging chunk "
+                        f"(exit {append_code}): "
+                        f"{append_output.strip() or '(no output)'}"
+                    )
+
+            verify = await self.sandbox.run(
+                f"test \"$(wc -c < {_shell_quote(sandbox_path)})\" "
+                f"-eq {len(encoded)}"
+            )
+            verify_output, verify_code = _result_values(verify)
+            if verify_code != 0:
+                raise RuntimeError(
+                    "Hosted sandbox staging file failed size verification "
+                    f"(expected {len(encoded)} bytes): "
+                    f"{verify_output.strip() or '(no output)'}"
+                )
+        except Exception:
+            try:
+                await self.sandbox.run(
+                    f"rm -f -- {_shell_quote(sandbox_path)}"
+                )
+            except Exception:
+                pass
+            raise
+        return sandbox_path
+
+    async def _install_staged_file(
+        self,
+        staged_path: str,
+        target_path: str,
+        *,
+        create_parent: bool,
+    ) -> tuple[str, int]:
+        """Atomically install a staged file while preserving target mode."""
+        parent_setup = (
+            'mkdir -p -- "$parent"\n'
+            if create_parent
+            else '[ -d "$parent" ] || { echo "Parent directory does not exist: '
+            '$parent"; exit 1; }\n'
+        )
+        command = (
+            "set -eu\n"
+            f"source_file={_shell_quote(staged_path)}\n"
+            f"target={_shell_quote(target_path)}\n"
+            'parent=$(dirname -- "$target")\n'
+            f"{parent_setup}"
+            'if [ -L "$target" ]; then\n'
+            '  cat -- "$source_file" > "$target"\n'
+            '  rm -f -- "$source_file"\n'
+            "  exit 0\n"
+            "fi\n"
+            'temporary=$(mktemp "$parent/.openreward-write.XXXXXX")\n'
+            'cleanup() { rm -f -- "$temporary" "$source_file"; }\n'
+            "trap cleanup EXIT HUP INT TERM\n"
+            'cat -- "$source_file" > "$temporary"\n'
+            'if [ -e "$target" ]; then\n'
+            '  mode=$(stat -c "%a" -- "$target")\n'
+            '  chmod "$mode" "$temporary"\n'
+            "else\n"
+            '  chmod 644 "$temporary"\n'
+            "fi\n"
+            'mv -f -- "$temporary" "$target"\n'
+            'rm -f -- "$source_file"\n'
+            "trap - EXIT HUP INT TERM\n"
+        )
+        result = await self.sandbox.run(command)
+        return _result_values(result)
+
     # ----- tools -----
 
     @tool
     async def bash(self, input: BashInput) -> ToolOutput:
         """Run a bash command in the container."""
-        assert self.workdir is not None, "setup() must run before tools"
-        cmd = f"cd {_shell_quote(self.workdir)} && {input.command}"
-        result = await self.sandbox.run(cmd)
-        output, exit_code = _result_values(result)
-        output = _bounded_output(output)
-        s = output if output else "(no output)"
-        return _text_output(f"{s}\nExit code: {exit_code}")
+        try:
+            assert self.workdir is not None, "setup() must run before tools"
+            cmd = f"cd {_shell_quote(self.workdir)} && {input.command}"
+            result = await self.sandbox.run(cmd)
+            output, exit_code = _result_values(result)
+            output = _bounded_output(output)
+            s = output if output else "(no output)"
+            return _command_output(s, exit_code)
+        except Exception as error:
+            return _tool_error("bash", error)
 
     @tool
     async def str_replace(self, input: StrReplaceInput) -> ToolOutput:
         """Replace a unique string in a file with another string."""
-        res = await self.sandbox.run(f"cat -- {_shell_quote(input.path)}")
-        content, exit_code = _result_values(res)
-        if exit_code != 0:
-            s = content if content else "(no output)"
-            return _text_output(f"{s}\nExit code: {exit_code}")
+        try:
+            if self.or_client is None:
+                res = await self.sandbox.run(
+                    f"cat -- {_shell_quote(input.path)}"
+                )
+                content, exit_code = _result_values(res)
+                error_output = content
+            else:
+                # Hosted sandbox output defaults to 50 KB, which silently
+                # truncates source files before replacement. Base64 also
+                # preserves trailing newlines that the hosted SDK strips from
+                # ordinary command output.
+                res = await self.sandbox.run(
+                    f"base64 {_shell_quote(input.path)}",
+                    max_bytes=None,
+                    sanitise=False,
+                )
+                encoded_content, exit_code = _result_values(res)
+                error_output = encoded_content
+                content = ""
+                if exit_code == 0:
+                    try:
+                        content = base64.b64decode(
+                            encoded_content.encode("ascii"),
+                            validate=False,
+                        ).decode("utf-8")
+                    except (UnicodeDecodeError, UnicodeEncodeError, ValueError) as error:
+                        raise RuntimeError(
+                            f"Could not decode source file {input.path}: {error}"
+                        ) from error
+            if exit_code != 0:
+                s = error_output if error_output else "(no output)"
+                return _command_output(
+                    s,
+                    exit_code,
+                    extra_metadata={"tool": "str_replace"},
+                )
 
-        count = content.count(input.old_str)
-        if count == 0:
-            return _text_output(f"Error: The string to replace was not found in {input.path}\nExit code: 1")
-        if count > 1:
-            return _text_output(f"Error: The string to replace appears {count} times in {input.path}. It must be unique.\nExit code: 1")
+            count = content.count(input.old_str)
+            if count == 0:
+                return _tool_error(
+                    "str_replace",
+                    f"The string to replace was not found in {input.path}",
+                )
+            if count > 1:
+                return _tool_error(
+                    "str_replace",
+                    (
+                        f"The string to replace appears {count} times in "
+                        f"{input.path}. It must be unique."
+                    ),
+                )
 
-        new_content = content.replace(input.old_str, input.new_str, 1)
-        encoded = base64.b64encode(new_content.encode('utf-8')).decode('ascii')
-        write_cmd = f"echo '{encoded}' | base64 -d > {_shell_quote(input.path)}"
-        result = await self.sandbox.run(write_cmd)
-        output, exit_code = _result_values(result)
-
-        s = output if output else f"Successfully replaced string in {input.path}"
-        return _text_output(f"{s}\nExit code: {exit_code}")
+            new_content = content.replace(input.old_str, input.new_str, 1)
+            staged_path = await self._stage_text_file(new_content)
+            output, exit_code = await self._install_staged_file(
+                staged_path,
+                input.path,
+                create_parent=False,
+            )
+            s = (
+                output
+                if output
+                else f"Successfully replaced string in {input.path}"
+            )
+            return _command_output(
+                s,
+                exit_code,
+                extra_metadata={"tool": "str_replace"},
+            )
+        except Exception as error:
+            return _tool_error("str_replace", error)
 
     @tool
     async def view(self, input: ViewInput) -> ToolOutput:
         """View file contents or directory listings."""
-        res = await self.sandbox.run(f"test -d {_shell_quote(input.path)} && echo 'dir' || echo 'file'")
-        output, _ = _result_values(res)
-        is_dir = output.strip() == "dir"
+        try:
+            res = await self.sandbox.run(
+                f"test -d {_shell_quote(input.path)} && "
+                "echo 'dir' || echo 'file'"
+            )
+            output, probe_exit_code = _result_values(res)
+            if probe_exit_code != 0:
+                return _command_output(
+                    output or "(no output)",
+                    probe_exit_code,
+                    extra_metadata={"tool": "view"},
+                )
+            is_dir = output.strip() == "dir"
 
-        if is_dir:
-            cmd = f"find {_shell_quote(input.path)} -maxdepth 2 -not -path '*/\\.*' -not -path '*/node_modules/*' | head -100"
-        else:
-            if input.view_range:
-                start, end = input.view_range
-                if end == -1:
-                    cmd = f"cat -n {_shell_quote(input.path)} | tail -n +{start}"
-                else:
-                    cmd = f"cat -n {_shell_quote(input.path)} | sed -n '{start},{end}p'"
+            if is_dir:
+                cmd = (
+                    f"find {_shell_quote(input.path)} -maxdepth 2 "
+                    "-not -path '*/\\.*' "
+                    "-not -path '*/node_modules/*' | head -100"
+                )
             else:
-                cmd = f"cat -n {_shell_quote(input.path)}"
+                if input.view_range:
+                    start, end = input.view_range
+                    if end == -1:
+                        cmd = (
+                            f"cat -n {_shell_quote(input.path)} "
+                            f"| tail -n +{start}"
+                        )
+                    else:
+                        cmd = (
+                            f"cat -n {_shell_quote(input.path)} "
+                            f"| sed -n '{start},{end}p'"
+                        )
+                else:
+                    cmd = f"cat -n {_shell_quote(input.path)}"
 
-        res = await self.sandbox.run(cmd)
-        output, exit_code = _result_values(res)
+            res = await self.sandbox.run(cmd)
+            output, exit_code = _result_values(res)
 
-        if len(output) > 16000:
-            lines = output.split('\n')
-            mid = len(lines) // 2
-            keep_start = mid // 2
-            keep_end = mid // 2
-            output = '\n'.join(lines[:keep_start]) + \
-                    f"\n\n... [truncated {len(lines) - keep_start - keep_end} lines] ...\n\n" + \
-                    '\n'.join(lines[-keep_end:])
+            if len(output) > 16000:
+                lines = output.split('\n')
+                mid = len(lines) // 2
+                keep_start = mid // 2
+                keep_end = mid // 2
+                output = (
+                    '\n'.join(lines[:keep_start])
+                    + (
+                        f"\n\n... [truncated "
+                        f"{len(lines) - keep_start - keep_end} lines] ...\n\n"
+                    )
+                    + '\n'.join(lines[-keep_end:])
+                )
 
-        s = output if output else "(no output)"
-        return _text_output(f"{s}\nExit code: {exit_code}")
+            s = output if output else "(no output)"
+            return _command_output(
+                s,
+                exit_code,
+                extra_metadata={"tool": "view"},
+            )
+        except Exception as error:
+            return _tool_error("view", error)
 
     @tool
     async def create_file(self, input: CreateFileInput) -> ToolOutput:
         """Create a new file with the specified content."""
-        parent_dir = "/".join(input.path.rsplit("/", 1)[:-1])
-        if parent_dir:
-            await self.sandbox.run(f"mkdir -p {_shell_quote(parent_dir)}")
-
-        encoded = base64.b64encode(input.file_text.encode('utf-8')).decode('ascii')
-        write_cmd = f"echo '{encoded}' | base64 -d > {_shell_quote(input.path)}"
-        result = await self.sandbox.run(write_cmd)
-        output, exit_code = _result_values(result)
-
-        s = output if output else f"Successfully created {input.path}"
-        return _text_output(f"{s}\nExit code: {exit_code}")
+        try:
+            staged_path = await self._stage_text_file(input.file_text)
+            output, exit_code = await self._install_staged_file(
+                staged_path,
+                input.path,
+                create_parent=True,
+            )
+            s = output if output else f"Successfully created {input.path}"
+            return _command_output(
+                s,
+                exit_code,
+                extra_metadata={"tool": "create_file"},
+            )
+        except Exception as error:
+            return _tool_error("create_file", error)
 
     @tool
     async def submit_answer(self) -> ToolOutput:
         """Submit your solution. Applies the test patch, runs the test suite, and scores."""
+        try:
+            return await self._grade_submission()
+        except Exception as error:
+            return _tool_error(
+                "submit_answer",
+                error,
+                finished=True,
+                reward=0.0,
+                invalid=True,
+            )
+
+    async def _capture_submission_diagnostics(
+        self,
+    ) -> tuple[str, dict[str, Any]]:
+        """Capture agent changes before the hidden test patch mutates the tree."""
         assert self.workdir is not None, "setup() must run before tools"
-        # 1. Apply the held-out patch from stdin. Enroot starts a fresh mount
-        # namespace for each command, so a file written under /tmp by one run
-        # is not portable to the next run unless the backend mounts session tmp.
-        test_patch_encoded = base64.b64encode(
-            self.parsed.test_patch.encode("utf-8")
-        ).decode("ascii")
-        patch_stream = f"echo '{test_patch_encoded}' | base64 -d"
-        apply_result = await self.sandbox.run(
-            f"cd {_shell_quote(self.workdir)} && "
-            f"({patch_stream} | git apply - || "
-            f"{patch_stream} | git apply --3way -)"
+        status_begin = "__OPENREWARD_STATUS_BEGIN__"
+        status_end = "__OPENREWARD_STATUS_END__"
+        count_prefix = "__OPENREWARD_CHANGED_ENTRY_COUNT__="
+        hash_prefix = "__OPENREWARD_TRACKED_DIFF_HASH__="
+        command = (
+            f"cd {_shell_quote(self.workdir)}\n"
+            f"printf '%s\\n' {status_begin}\n"
+            "git status --porcelain=v1 --untracked-files=normal "
+            "| sed -n '1,200p'\n"
+            f"printf '%s\\n' {status_end}\n"
+            "changed_count=$(git status --porcelain=v1 "
+            "--untracked-files=normal | wc -l)\n"
+            f"printf '{count_prefix}%s\\n' \"$changed_count\"\n"
+            "diff_hash=$(git diff --binary --no-ext-diff HEAD -- "
+            "| git hash-object --stdin)\n"
+            f"printf '{hash_prefix}%s\\n' \"$diff_hash\"\n"
+            "printf '%s\\n' '__OPENREWARD_DIFF_STAT_BEGIN__'\n"
+            "git diff --stat --no-ext-diff HEAD -- | sed -n '1,200p'\n"
+            "printf '%s\\n' '__OPENREWARD_DIFF_STAT_END__'\n"
         )
-        apply_output, apply_code = _result_values(apply_result)
-        if apply_code != 0:
-            return ToolOutput(
-                blocks=[
-                    TextBlock(
-                        text=f"Failed to apply test patch:\n{apply_output}"
+        try:
+            result = await self.sandbox.run(command)
+            output, exit_code = _result_values(result)
+        except Exception as error:
+            message = f"Could not capture repository diagnostics: {error}"
+            return message, {
+                "repository_diagnostics_ok": False,
+                "repository_diagnostics_error": str(error),
+            }
+
+        bounded = _bounded_text(
+            output.strip() or "(no repository diagnostic output)",
+            int(os.getenv("SWE_GRADER_DIAGNOSTIC_MAX_CHARS", "12000")),
+            label="repository diagnostics truncated",
+        )
+        metadata: dict[str, Any] = {
+            "repository_diagnostics_ok": exit_code == 0,
+            "repository_diagnostics_exit_code": exit_code,
+        }
+        lines = output.splitlines()
+        try:
+            start = lines.index(status_begin) + 1
+            end = lines.index(status_end, start)
+            metadata["changed_files_preview"] = lines[start:end]
+        except ValueError:
+            metadata["changed_files_preview"] = []
+        for line in lines:
+            if line.startswith(count_prefix):
+                try:
+                    metadata["changed_entry_count"] = int(
+                        line.removeprefix(count_prefix).strip()
                     )
-                ],
+                except ValueError:
+                    pass
+            elif line.startswith(hash_prefix):
+                metadata["tracked_diff_hash"] = line.removeprefix(
+                    hash_prefix
+                ).strip()
+        return bounded, metadata
+
+    async def _grade_submission(self) -> ToolOutput:
+        assert self.workdir is not None, "setup() must run before tools"
+        submission_diagnostics, diagnostic_metadata = (
+            await self._capture_submission_diagnostics()
+        )
+
+        # 1. Apply the held-out patch. Local runtimes can stream it directly
+        # over stdin, keeping the hidden tests out of both argv and /tmp. The
+        # hosted API has no stdin channel, so it uses the bounded staging
+        # transport and removes the private file in the same command.
+        if self.or_client is None:
+            patch_bytes = self.parsed.test_patch.encode("utf-8")
+            apply_result = await self.sandbox.run(
+                f"cd {_shell_quote(self.workdir)} && git apply -",
+                stdin_data=patch_bytes,
+            )
+            apply_output, apply_code = _result_values(apply_result)
+            if apply_code != 0:
+                three_way_result = await self.sandbox.run(
+                    f"cd {_shell_quote(self.workdir)} && git apply --3way -",
+                    stdin_data=patch_bytes,
+                )
+                three_way_output, apply_code = _result_values(
+                    three_way_result
+                )
+                apply_output = "\n".join(
+                    output
+                    for output in (apply_output, three_way_output)
+                    if output
+                )
+        else:
+            patch_path = await self._stage_text_file(self.parsed.test_patch)
+            apply_result = await self.sandbox.run(
+                "set -u\n"
+                f"cd {_shell_quote(self.workdir)}\n"
+                f"patch_file={_shell_quote(patch_path)}\n"
+                'cleanup() { rm -f -- "$patch_file"; }\n'
+                "trap cleanup EXIT HUP INT TERM\n"
+                'if git apply "$patch_file"; then\n'
+                "  :\n"
+                "else\n"
+                '  git apply --3way "$patch_file"\n'
+                "fi\n"
+            )
+            apply_output, apply_code = _result_values(apply_result)
+        if apply_code != 0:
+            detail = apply_output if apply_output else "(no output)"
+            return _command_output(
+                (
+                    "Pre-submission repository state:\n"
+                    f"{submission_diagnostics}\n\n"
+                    f"Failed to apply test patch:\n{detail}"
+                ),
+                apply_code,
                 reward=0.0,
                 finished=True,
+                extra_metadata={
+                    "tool": "submit_answer",
+                    "stage": "apply_test_patch",
+                    "test_patch_apply_exit_code": apply_code,
+                    **diagnostic_metadata,
+                },
             )
 
         # 2. Run test command
@@ -394,12 +834,34 @@ class SWERebenchV2(Environment):
                 normalize_test_name(test_id): status
                 for test_id, status in parser_fn(test_output).items()
             }
-        except Exception as e:
-            return ToolOutput(
-                blocks=[TextBlock(text=f"Log parser error ({parser_name}): {e}\n\nRaw output:\n{test_output[:4000]}")],
+        except Exception as error:
+            raw_output = _bounded_text(
+                test_output,
+                int(os.getenv("SWE_GRADER_RAW_OUTPUT_MAX_CHARS", "20000")),
+                label="raw test output truncated",
+            )
+            result = _tool_error(
+                "submit_answer",
+                (
+                    "Pre-submission repository state:\n"
+                    f"{submission_diagnostics}\n\n"
+                    f"Log parser error ({parser_name}): {error}\n\n"
+                    f"Raw test output (bounded):\n{raw_output}"
+                ),
                 reward=0.0,
                 finished=True,
+                invalid=True,
             )
+            assert result.metadata is not None
+            result.metadata = {
+                **result.metadata,
+                "stage": "parse_test_output",
+                "parser": parser_name,
+                "test_exit_code": test_code,
+                "test_patch_apply_exit_code": apply_code,
+                **diagnostic_metadata,
+            }
+            return result
 
         # 4. Check FAIL_TO_PASS and PASS_TO_PASS
         score = score_test_results(
@@ -410,28 +872,92 @@ class SWERebenchV2(Environment):
         )
         f2p_passed = score.fail_to_pass_passed
         p2p_passed = score.pass_to_pass_passed
-        reward = score.reward
+        ordinary_test_exit = 0 <= test_code <= 1
+        reward = score.reward if ordinary_test_exit else 0.0
 
-        # Build summary
-        f2p_detail = []
-        for t in self.parsed.FAIL_TO_PASS:
-            status = test_results.get(t, "NOT_FOUND")
-            f2p_detail.append(f"  {t}: {status}")
+        # Build a bounded forensic summary. Tool outputs are retained in
+        # rollout event artifacts, which makes parser misses, test-runner
+        # aborts, and compilation failures distinguishable after the fact.
+        f2p_detail, _ = _status_detail(
+            self.parsed.FAIL_TO_PASS,
+            test_results,
+            only_nonpassing=False,
+        )
+        p2p_detail, p2p_nonpassing = _status_detail(
+            self.parsed.PASS_TO_PASS,
+            test_results,
+            only_nonpassing=True,
+        )
         p2p_total = len(self.parsed.PASS_TO_PASS)
+        f2p_not_found = sum(
+            test_results.get(
+                normalize_test_name(test_id),
+                "NOT_FOUND",
+            )
+            == "NOT_FOUND"
+            for test_id in self.parsed.FAIL_TO_PASS
+        )
+        p2p_not_found = sum(
+            test_results.get(
+                normalize_test_name(test_id),
+                "NOT_FOUND",
+            )
+            == "NOT_FOUND"
+            for test_id in self.parsed.PASS_TO_PASS
+        )
+        raw_output = _bounded_text(
+            test_output,
+            int(os.getenv("SWE_GRADER_RAW_OUTPUT_MAX_CHARS", "20000")),
+            label="raw test output truncated",
+        )
+        p2p_detail_text = (
+            "\n".join(p2p_detail)
+            if p2p_detail
+            else "  (all expected PASS_TO_PASS tests passed)"
+        )
 
         summary = (
+            "Pre-submission repository state:\n"
+            f"{submission_diagnostics}\n\n"
+            f"Test patch apply exit code: {apply_code}\n"
             f"Test command exit code: {test_code}\n"
+            f"Ordinary test exit (0 or 1): {ordinary_test_exit}\n"
+            f"Log parser: {parser_name}\n"
+            f"Parsed tests: {len(test_results)}\n"
             f"FAIL_TO_PASS: {f2p_passed}/{len(self.parsed.FAIL_TO_PASS)} passed\n"
+            f"FAIL_TO_PASS NOT_FOUND: {f2p_not_found}\n"
             f"FAIL_TO_PASS detail:\n" +
             "\n".join(f2p_detail) + "\n"
             f"PASS_TO_PASS: {p2p_passed}/{p2p_total} passed\n"
-            f"Reward: {reward}"
+            f"PASS_TO_PASS nonpassing: {p2p_nonpassing}\n"
+            f"PASS_TO_PASS NOT_FOUND: {p2p_not_found}\n"
+            f"PASS_TO_PASS nonpassing detail:\n"
+            f"{p2p_detail_text}\n"
+            f"Reward: {reward}\n\n"
+            f"Raw test output (bounded):\n{raw_output}"
         )
 
-        return ToolOutput(
-            blocks=[TextBlock(text=summary)],
+        return _text_output(
+            summary,
             reward=reward,
             finished=True,
+            metadata={
+                "ok": ordinary_test_exit,
+                "tool": "submit_answer",
+                "test_patch_apply_exit_code": apply_code,
+                "test_exit_code": test_code,
+                "ordinary_test_exit": ordinary_test_exit,
+                "parser": parser_name,
+                "parsed_test_count": len(test_results),
+                "fail_to_pass_passed": f2p_passed,
+                "fail_to_pass_total": len(self.parsed.FAIL_TO_PASS),
+                "fail_to_pass_not_found": f2p_not_found,
+                "pass_to_pass_passed": p2p_passed,
+                "pass_to_pass_total": p2p_total,
+                "pass_to_pass_nonpassing": p2p_nonpassing,
+                "pass_to_pass_not_found": p2p_not_found,
+                **diagnostic_metadata,
+            },
         )
 
 

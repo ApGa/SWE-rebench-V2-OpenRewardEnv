@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +12,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from build_index import build_index
 from dataset_store import TaskDataset
-from sandbox_backends import EnrootSandbox, LocalRunResult, _enroot_import_uri
+from sandbox_backends import (
+    EnrootSandbox,
+    LocalRunResult,
+    _enroot_import_environment,
+    _enroot_import_uri,
+    local_image_reference,
+)
 
 
 def _task(instance_id: str, test_cmd: str | list[str]) -> dict:
@@ -98,6 +106,23 @@ class TaskDatasetTest(unittest.TestCase):
 
 
 class SandboxHelpersTest(unittest.TestCase):
+    def test_prime_verified_image_maps_to_upstream_oci_reference(self) -> None:
+        prime_image = (
+            "prime/primeintellect/elastic-synthetics:316-f52f0bf"
+        )
+        upstream_image = (
+            "docker.io/swerebenchv2/elastic-synthetics:316-f52f0bf"
+        )
+        self.assertEqual(local_image_reference(prime_image), upstream_image)
+        self.assertEqual(
+            _enroot_import_uri(prime_image),
+            "docker://swerebenchv2/elastic-synthetics:316-f52f0bf",
+        )
+        self.assertEqual(
+            EnrootSandbox(prime_image).image,
+            upstream_image,
+        )
+
     def test_enroot_registry_uri_conversion(self) -> None:
         self.assertEqual(
             _enroot_import_uri("docker.io/swerebenchv2/repo:tag"),
@@ -137,6 +162,109 @@ class SandboxHelpersTest(unittest.TestCase):
         output, return_code = result
         self.assertEqual((output, return_code), ("ok", 0))
         self.assertEqual(result.exit_code, 0)
+
+    @unittest.skipUnless(shutil.which("tar"), "requires GNU tar")
+    def test_enroot_import_delays_read_only_directory_restoration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            readonly = source / "readonly"
+            output = root / "output"
+            readonly.mkdir(parents=True)
+            output.mkdir()
+            (readonly / "first").write_text("first")
+            (readonly / "last").write_text("last")
+            (source / "interleaved").write_text("interleaved")
+            readonly.chmod(0o555)
+            archive = root / "layer.tar"
+
+            try:
+                subprocess.run(
+                    [
+                        "tar",
+                        "-C",
+                        str(source),
+                        "--no-recursion",
+                        "-cf",
+                        str(archive),
+                        "readonly",
+                        "readonly/first",
+                        "interleaved",
+                        "readonly/last",
+                    ],
+                    check=True,
+                )
+                subprocess.run(
+                    ["tar", "-C", str(output), "-pxf", str(archive)],
+                    check=True,
+                    env=_enroot_import_environment(),
+                )
+                self.assertEqual(
+                    (output / "readonly" / "last").read_text(),
+                    "last",
+                )
+                self.assertEqual(
+                    (output / "readonly").stat().st_mode & 0o777,
+                    0o555,
+                )
+            finally:
+                # TemporaryDirectory cannot remove children of a read-only
+                # directory even when the current user owns that directory.
+                readonly.chmod(0o755)
+                extracted = output / "readonly"
+                if extracted.exists():
+                    extracted.chmod(0o755)
+
+    def test_enroot_import_retries_and_sets_tar_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls = root / "calls"
+            enroot = bin_dir / "enroot"
+            enroot.write_text(
+                """#!/bin/sh
+set -eu
+test "$1" = import
+case " ${TAR_OPTIONS-} " in
+  *" --delay-directory-restore "*) ;;
+  *) printf 'missing delayed directory restore'; exit 4 ;;
+esac
+count=0
+test ! -f "$CALLS_FILE" || count=$(cat "$CALLS_FILE")
+count=$((count + 1))
+printf '%s' "$count" > "$CALLS_FILE"
+if [ "$count" -lt 2 ]; then
+  printf 'transient registry failure'
+  exit 5
+fi
+shift
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    printf 'fake sqsh' > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 2
+"""
+            )
+            enroot.chmod(0o755)
+
+            env = {
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "CALLS_FILE": str(calls),
+                "SWE_ENROOT_IMAGE_CACHE": str(root / "images"),
+                "SWE_ENROOT_IMPORT_ATTEMPTS": "2",
+                "SWE_ENROOT_IMPORT_RETRY_DELAY_SECONDS": "0",
+                "TAR_OPTIONS": "--warning=no-unknown-keyword",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                sandbox = EnrootSandbox("docker.io/example/task:latest")
+                image_path = sandbox._ensure_image_sync()
+
+            self.assertEqual(calls.read_text(), "2")
+            self.assertEqual(image_path.read_text(), "fake sqsh")
 
     def test_enroot_backend_lifecycle_with_cli_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
