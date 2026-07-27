@@ -176,9 +176,10 @@ without starting containers:
 ```
 
 Execution mode starts clean task images twice. The base phase applies only the
-held-out test patch and requires every F2P test to be observed failing while
-P2P passes. The gold phase applies the gold and held-out patches and requires
-every expected test to be parsed and pass:
+held-out test patch and requires at least one F2P failure (so the unmodified
+task earns binary reward zero), while every expected ID is observed and P2P
+passes. The gold phase applies the gold and held-out patches and requires every
+expected test to be parsed and pass:
 
 ```bash
 .venv-openreward/bin/python preflight.py \

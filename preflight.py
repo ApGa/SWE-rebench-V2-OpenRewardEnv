@@ -4,7 +4,7 @@ The inexpensive metadata mode scans task definitions without starting
 containers. Execution mode performs two clean evaluations for each selected
 task:
 
-* base commit + held-out test patch: F2P must be observed failing and P2P pass;
+* base commit + held-out test patch: at least one F2P must fail and P2P pass;
 * gold patch + held-out test patch: every F2P and P2P test must pass.
 
 Results are written as JSON Lines so a long Slurm shard retains completed work
@@ -376,11 +376,17 @@ def assess_phase(
     ordinary_test_exit = 0 <= test_exit_code <= 1
 
     if phase == "base":
+        observed_f2p_failures = sorted(
+            {
+                test_id
+                for test_id in normalized_f2p
+                if expected[test_id] in _EXPLICIT_FAILURES
+            }
+        )
         wrong_f2p = [
             test_id
             for test_id in normalized_f2p
-            if test_id not in shared_expected
-            if expected[test_id] not in _EXPLICIT_FAILURES
+            if expected[test_id] not in {*_EXPLICIT_FAILURES, _PASSED}
         ]
         wrong_p2p = [
             test_id
@@ -399,8 +405,10 @@ def assess_phase(
             and not wrong_f2p
             and not wrong_p2p
             and not wrong_shared
+            and bool(observed_f2p_failures)
         )
     elif phase == "gold":
+        observed_f2p_failures = []
         wrong_f2p = [
             test_id
             for test_id in normalized_f2p
@@ -428,11 +436,18 @@ def assess_phase(
         "missing_count": len(missing),
         "wrong_fail_to_pass_count": len(wrong_f2p),
         "wrong_pass_to_pass_count": len(wrong_p2p),
+        "observed_fail_to_pass_failure_count": len(
+            observed_f2p_failures
+        ),
+        "no_fail_to_pass_failure": (
+            phase == "base" and not observed_f2p_failures
+        ),
         "shared_expected_count": len(shared_expected),
         "wrong_shared_count": len(wrong_shared),
         "missing": missing,
         "wrong_fail_to_pass": wrong_f2p,
         "wrong_pass_to_pass": wrong_p2p,
+        "observed_fail_to_pass_failures": observed_f2p_failures,
         "shared_expected": sorted(shared_expected),
         "wrong_shared": wrong_shared,
         "expected_results": expected,

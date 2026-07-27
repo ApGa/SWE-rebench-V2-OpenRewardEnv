@@ -118,6 +118,36 @@ class AssessPhaseTest(unittest.TestCase):
         )
         self.assertTrue(zero_exit["valid"])
 
+        partial_f2p = assess_phase(
+            "base",
+            {
+                "new_test": "FAILED",
+                "also_new": "PASSED",
+                "old_test": "PASSED",
+            },
+            ["new_test", "also_new"],
+            ["old_test"],
+            1,
+        )
+        self.assertTrue(partial_f2p["valid"])
+        self.assertEqual(
+            partial_f2p["observed_fail_to_pass_failure_count"],
+            1,
+        )
+
+        no_edit_pass = assess_phase(
+            "base",
+            {
+                "new_test": "PASSED",
+                "old_test": "PASSED",
+            },
+            ["new_test"],
+            ["old_test"],
+            0,
+        )
+        self.assertFalse(no_edit_pass["valid"])
+        self.assertTrue(no_edit_pass["no_fail_to_pass_failure"])
+
         missing = assess_phase(
             "base",
             {"old_test": "PASSED"},
