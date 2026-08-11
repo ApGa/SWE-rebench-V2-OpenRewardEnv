@@ -1,11 +1,14 @@
 import asyncio
+import importlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 from unittest import mock
 
 import pyarrow as pa
@@ -92,6 +95,62 @@ class TaskDatasetTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "columns must not be empty"):
                 dataset.get_row(0, columns=[])
+
+    def test_environment_tools_declare_task_execution_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            pq.write_table(
+                pa.Table.from_pylist([_task("task-0", "pytest")]),
+                data_dir / "data.parquet",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DATA_DIR": str(data_dir),
+                    "TASK_INDEX": str(data_dir / "missing-index.json"),
+                },
+            ):
+                sys.modules.pop("server", None)
+                server = importlib.import_module("server")
+
+            tools = {
+                tool.name: tool
+                for tool in server.SWERebenchV2.list_tools().tools
+            }
+            key = server.TOOL_ROUTING_SCHEMA_KEY
+
+            bash_schema = tools["bash"].input_schema
+            self.assertIsNotNone(bash_schema)
+            bash_routing = cast(
+                dict[str, Any],
+                bash_schema[key],  # type: ignore[index]
+            )
+            self.assertEqual(bash_routing["version"], 1)
+            self.assertEqual(bash_routing["execution_domain"], "task")
+            self.assertEqual(bash_routing["invocation"], {"kind": "direct"})
+            self.assertEqual(
+                set(bash_routing["capabilities"]),
+                {
+                    "filesystem.read",
+                    "filesystem.write",
+                    "system.execute",
+                    "python.execute",
+                },
+            )
+            expected_capabilities = {
+                "view": ["filesystem.read"],
+                "str_replace": ["filesystem.read", "filesystem.write"],
+                "create_file": ["filesystem.write"],
+                "submit_answer": ["task.submit"],
+            }
+            for tool_name, expected in expected_capabilities.items():
+                schema = tools[tool_name].input_schema
+                self.assertIsNotNone(schema)
+                routing = cast(
+                    dict[str, Any],
+                    schema[key],  # type: ignore[index]
+                )
+                self.assertEqual(routing["capabilities"], expected)
 
     def test_reports_out_of_range_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

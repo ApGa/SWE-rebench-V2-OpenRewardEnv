@@ -1,6 +1,7 @@
 """OpenReward environment for SWE-rebench-V2."""
 import asyncio
 import base64
+import functools
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -9,7 +10,14 @@ from uuid import uuid4
 from openreward import AsyncOpenReward, SandboxSettings
 from openreward.api.sandboxes.types import MachineSize
 from openreward.environments import Environment, Server, tool
-from openreward.environments.types import Blocks, JSONObject, TextBlock, ToolOutput
+from openreward.environments.types import (
+    Blocks,
+    JSONObject,
+    ListToolsOutput,
+    TextBlock,
+    ToolOutput,
+    ToolSpec,
+)
 from pydantic import BaseModel, Field
 
 from dataset_store import TaskDataset
@@ -55,6 +63,23 @@ class TaskSpec(BaseModel):
 # ---------------------------------------------------------------------------
 
 ENVIRONMENT_NAME = "nebius/SWE-rebench-V2"
+TOOL_ROUTING_SCHEMA_KEY = "x-openhands-tool-routing"
+
+
+def _with_direct_tool_routing(
+    spec: ToolSpec,
+    capabilities: tuple[str, ...],
+) -> ToolSpec:
+    """Attach task-runtime routing as an ignorable JSON-Schema extension."""
+
+    schema = dict(spec.input_schema or {"type": "object", "properties": {}})
+    schema[TOOL_ROUTING_SCHEMA_KEY] = {
+        "version": 1,
+        "execution_domain": "task",
+        "capabilities": list(capabilities),
+        "invocation": {"kind": "direct"},
+    }
+    return spec.model_copy(update={"input_schema": schema})
 
 
 class BashInput(BaseModel):
@@ -254,6 +279,35 @@ def _get_log_parser(parser_name: str):
 
 class SWERebenchV2(Environment):
     """OpenReward environment for SWE-rebench-V2 tasks."""
+
+    _TOOL_CAPABILITIES = {
+        "bash": (
+            "filesystem.read",
+            "filesystem.write",
+            "system.execute",
+            "python.execute",
+        ),
+        "view": ("filesystem.read",),
+        "str_replace": ("filesystem.read", "filesystem.write"),
+        "create_file": ("filesystem.write",),
+        "submit_answer": ("task.submit",),
+    }
+
+    @classmethod
+    @functools.cache
+    def list_tools(cls) -> ListToolsOutput:
+        tools = super().list_tools()
+        return ListToolsOutput(
+            tools=[
+                _with_direct_tool_routing(
+                    spec,
+                    cls._TOOL_CAPABILITIES[spec.name],
+                )
+                if spec.name in cls._TOOL_CAPABILITIES
+                else spec
+                for spec in tools.tools
+            ]
+        )
 
     def __init__(
         self,
