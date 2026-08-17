@@ -12,6 +12,7 @@ import asyncio
 import fcntl
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -23,6 +24,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
 from uuid import uuid4
+
+
+_CARGO_ENV_PATH = b"/usr/local/cargo/env"
+_CARGO_ENV_MISSING_ERRORS = frozenset(
+    {
+        b"cat: no matches for /usr/local/cargo/env\n",
+        b"cat: no matches for /usr/local/cargo\n",
+    }
+)
+_CARGO_SOURCE_LINE = re.compile(rb"[ \t]*(?:\.|source)[ \t]+/usr/local/cargo/env[ \t]*")
 
 
 _PID_NAMESPACE_LAUNCHER = """\
@@ -933,8 +944,9 @@ class EnrootSandbox:
             if mount:
                 args += ["--mount", mount]
 
-        # Keep rc.local empty as defense in depth. The pass-through --rc above
-        # is what prevents Enroot from executing the image ENTRYPOINT itself.
+        # Keep rc.local empty as defense in depth. The selected SWE corpus was
+        # audited to contain comments-only immutable rc.local files; OCI
+        # wrappers and entrypoints for those images live in the copied rc.
         rc_local_path = self.session_tmp_dir / ".openreward-enroot-rc.local"
         args += ["--mount", f"{rc_local_path}:/etc/rc.local"]
         args += ["--mount", f"{self.session_tmp_dir}:/tmp"]
@@ -992,8 +1004,105 @@ class EnrootSandbox:
             )
         return workdir
 
-    def _image_workdir_sync(self, image_path: Path) -> str:
-        """Read OCI WORKDIR metadata from an immutable cached Enroot image."""
+    @staticmethod
+    def _sanitize_enroot_rc(
+        script: bytes,
+        *,
+        cargo_env_exists: bool | None,
+    ) -> bytes:
+        """Remove one exact, broken Cargo source command and nothing else."""
+
+        if b"\x00" in script:
+            raise RuntimeError("Invalid NUL byte in immutable Enroot command script")
+        try:
+            script.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "Immutable Enroot command script is not valid UTF-8"
+            ) from exc
+
+        if _CARGO_ENV_PATH not in script:
+            return script
+        if cargo_env_exists is None:
+            raise RuntimeError("Cargo environment path was not inspected")
+
+        source_indexes: list[int] = []
+        unknown_references: list[bytes] = []
+        # Split only on LF, the physical-line delimiter consumed by POSIX sh.
+        # ``bytes.splitlines()`` also splits on CR, VT, and FF and could expose
+        # a false command inside an otherwise unsupported shell line.
+        lines: list[bytes] = []
+        line_start = 0
+        while line_start < len(script):
+            newline = script.find(b"\n", line_start)
+            if newline < 0:
+                lines.append(script[line_start:])
+                break
+            lines.append(script[line_start : newline + 1])
+            line_start = newline + 1
+        for index, line in enumerate(lines):
+            # A CR before LF is shell input, not part of the delimiter.
+            body = line[:-1] if line.endswith(b"\n") else line
+            if _CARGO_ENV_PATH not in body:
+                continue
+            if _CARGO_SOURCE_LINE.fullmatch(body):
+                source_indexes.append(index)
+            else:
+                unknown_references.append(body)
+
+        if unknown_references:
+            raise RuntimeError(
+                "Unsupported Cargo environment reference in immutable Enroot "
+                "command script"
+            )
+        if len(source_indexes) != 1:
+            raise RuntimeError(
+                "Expected exactly one Cargo environment source command in "
+                "immutable Enroot command script"
+            )
+        if cargo_env_exists:
+            return script
+        # The observed node-local contamination is line one. Restrict repair
+        # to that exact shape so a source-looking heredoc body, continuation,
+        # or later command can never be deleted based on lexical appearance.
+        if source_indexes[0] != 0:
+            raise RuntimeError(
+                "Cargo environment source command is not the first physical line"
+            )
+        del lines[source_indexes[0]]
+        return b"".join(lines)
+
+    @staticmethod
+    def _cargo_env_exists_sync(
+        unsquashfs: str,
+        image_path: Path,
+        *,
+        timeout: float,
+    ) -> bool:
+        result = subprocess.run(
+            [unsquashfs, "-cat", str(image_path), "usr/local/cargo/env"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode == 0 and not result.stderr:
+            return True
+        if (
+            result.returncode == 2
+            and not result.stdout
+            and result.stderr in _CARGO_ENV_MISSING_ERRORS
+        ):
+            return False
+        diagnostic = (
+            (result.stderr or result.stdout).decode("utf-8", errors="replace").strip()
+        )
+        raise RuntimeError(
+            "Could not inspect Cargo environment in cached Enroot image: " + diagnostic
+        )
+
+    def _image_runtime_config_sync(self, image_path: Path) -> tuple[str, bytes]:
+        """Copy trusted immutable startup bytes and extract OCI WORKDIR."""
 
         timeout = float(os.getenv("SWE_ENROOT_INSPECT_TIMEOUT_SECONDS", "120"))
         unsquashfs = shutil.which("unsquashfs")
@@ -1004,17 +1113,37 @@ class EnrootSandbox:
         result = subprocess.run(
             [unsquashfs, "-cat", str(image_path), "etc/rc"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "Could not inspect cached Enroot image command script: "
-                + result.stdout.strip()
+        if result.returncode != 0 or result.stderr:
+            diagnostic = (
+                (result.stderr or result.stdout)
+                .decode("utf-8", errors="replace")
+                .strip()
             )
-        return self._workdir_from_enroot_rc(result.stdout)
+            raise RuntimeError(
+                "Could not inspect cached Enroot image command script: " + diagnostic
+            )
+        cargo_env_exists = None
+        if _CARGO_ENV_PATH in result.stdout:
+            cargo_env_exists = self._cargo_env_exists_sync(
+                unsquashfs,
+                image_path,
+                timeout=timeout,
+            )
+        command_script = self._sanitize_enroot_rc(
+            result.stdout,
+            cargo_env_exists=cargo_env_exists,
+        )
+        try:
+            script_text = command_script.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "Immutable Enroot command script is not valid UTF-8"
+            ) from exc
+        return self._workdir_from_enroot_rc(script_text), command_script
 
     async def start(self) -> None:
         if shutil.which("enroot") is None:
@@ -1045,8 +1174,8 @@ class EnrootSandbox:
             # Inspect immutable image metadata on the host. Never execute the
             # node-local writable rootfs's /etc/rc: in addition to containing
             # OCI ENTRYPOINT logic, that runtime file may be stale or damaged.
-            self.workdir = await asyncio.to_thread(
-                self._image_workdir_sync,
+            self.workdir, command_script = await asyncio.to_thread(
+                self._image_runtime_config_sync,
                 image_path,
             )
             self.namespace_control_dir = Path(
@@ -1060,10 +1189,11 @@ class EnrootSandbox:
             rc_local_path.write_text("")
             rc_local_path.chmod(0o600)
             rc_path = self.enroot_control_dir / "rc"
-            # `enroot start NAME COMMAND` still prepends the OCI ENTRYPOINT.
-            # Use a host-side pass-through rc so stale image startup code (for
-            # example `. /usr/local/cargo/env`) can never run.
-            rc_path.write_text('#!/bin/sh\nexec "$@"\n')
+            # Use startup bytes copied from the immutable SQSH, not the
+            # node-local writable rootfs. This preserves OCI wrappers and
+            # entrypoints while removing only one narrowly recognized source
+            # command when its Cargo environment file is provably absent.
+            rc_path.write_bytes(command_script)
             rc_path.chmod(0o700)
             # Mark removal necessary before spawning create: cancellation can
             # arrive after Enroot creates the named rootfs but before the

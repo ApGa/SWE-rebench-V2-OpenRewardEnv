@@ -30,6 +30,153 @@ async def _inline_to_thread(function, /, *args, **kwargs):
     return function(*args, **kwargs)
 
 
+_SWE_RC_CLASS_FIXTURES = {
+    "generic": b"""# io.buildah.version 1.38.1
+# org.opencontainers.image.ref.name ubuntu
+# org.opencontainers.image.version 22.04
+
+mkdir -p "/cloud-provider-azure" 2> /dev/null
+cd "/cloud-provider-azure" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  '/bin/bash'
+fi
+""",
+    "python": b"""# io.buildah.version 1.38.1
+
+mkdir -p "/PlasmaPy" 2> /dev/null
+cd "/PlasmaPy" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  'python3'
+fi
+""",
+    "php": b"""# io.buildah.version 1.38.1
+
+mkdir -p "/phpstan-disallowed-calls" 2> /dev/null
+cd "/phpstan-disallowed-calls" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec 'docker-php-entrypoint' "$@"
+else
+    exec 'docker-php-entrypoint' 'php' '-a'
+fi
+""",
+    "bash": b"""# io.buildah.version 1.38.1
+# org.opencontainers.image.source https://github.com/rust-lang/docker-rust
+
+mkdir -p "/salsa" 2> /dev/null
+cd "/salsa" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  'bash'
+fi
+""",
+    "cacert-jshell": b"""# io.buildah.version 1.38.1
+# org.opencontainers.image.ref.name ubuntu
+# org.opencontainers.image.version 24.04
+
+mkdir -p "/laboratory" 2> /dev/null
+cd "/laboratory" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec '/__cacert_entrypoint.sh' "$@"
+else
+    exec '/__cacert_entrypoint.sh' 'jshell'
+fi
+""",
+    "cacert-sbt": b"""# io.buildah.version 1.40.1
+# org.opencontainers.image.ref.name ubuntu
+# org.opencontainers.image.version 24.04
+
+mkdir -p "/scalameta" 2> /dev/null
+cd "/scalameta" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec '/__cacert_entrypoint.sh' "$@"
+else
+    exec '/__cacert_entrypoint.sh' 'sbt'
+fi
+""",
+    "maven": b"""# io.buildah.version 1.38.1
+# org.opencontainers.image.description Apache Maven is a software project management and comprehension tool. Based on the concept of a project object model (POM), Maven can manage a project's build, reporting and documentation from a central piece of information.
+# org.opencontainers.image.ref.name ubuntu
+# org.opencontainers.image.source https://github.com/carlossg/docker-maven
+# org.opencontainers.image.title Apache Maven
+# org.opencontainers.image.url https://github.com/carlossg/docker-maven
+# org.opencontainers.image.version 24.04
+
+mkdir -p "/kafka-topology-builder" 2> /dev/null
+cd "/kafka-topology-builder" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec '/usr/local/bin/mvn-entrypoint.sh' "$@"
+else
+    exec '/usr/local/bin/mvn-entrypoint.sh' 'mvn'
+fi
+""",
+    "R": b"""# io.buildah.version 1.38.1
+# org.opencontainers.image.authors Carl Boettiger <cboettig@ropensci.org>
+# org.opencontainers.image.base.name docker.io/library/ubuntu:jammy
+# org.opencontainers.image.description Reproducible builds to fixed version of R
+# org.opencontainers.image.licenses GPL-2.0-or-later
+# org.opencontainers.image.ref.name ubuntu
+# org.opencontainers.image.revision 2393f40bb1366538e21d1137803b3c1dfec4d2e1
+# org.opencontainers.image.source https://github.com/rocker-org/rocker-versioned2
+# org.opencontainers.image.title rocker/r-ver
+# org.opencontainers.image.vendor Rocker Project
+# org.opencontainers.image.version R-4.4.1
+
+mkdir -p "/scoringutils" 2> /dev/null
+cd "/scoringutils" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  'R'
+fi
+""",
+}
+
+
 def _task(instance_id: str, test_cmd: str | list[str]) -> dict:
     return {
         "instance_id": instance_id,
@@ -313,11 +460,20 @@ exit 2
                 """#!/bin/sh
 set -eu
 [ "$1" = "-cat" ] || exit 2
-printf '%s\n' \\
-  '. /usr/local/cargo/env' \\
-  'mkdir -p "/workspace" 2> /dev/null' \\
-  'cd "/workspace" && unset OLDPWD || exit 1' \\
-  'exec stale-entrypoint "$@"'
+case "$3" in
+  etc/rc)
+    printf '%s\n' \\
+      '. /usr/local/cargo/env' \\
+      'mkdir -p "/workspace" 2> /dev/null' \\
+      'cd "/workspace" && unset OLDPWD || exit 1' \\
+      'exec stale-entrypoint "$@"'
+    ;;
+  usr/local/cargo/env)
+    printf 'cat: no matches for /usr/local/cargo/env\n' >&2
+    exit 2
+    ;;
+  *) exit 2 ;;
+esac
 """
             )
             unsquashfs.chmod(0o755)
@@ -371,7 +527,8 @@ case "$1" in
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "--rc" ]; then
         [ -f "$2" ] || exit 4
-        grep -q 'exec "$@"' "$2" || exit 5
+        ! grep -q '/usr/local/cargo/env' "$2" || exit 5
+        grep -Fq 'exec stale-entrypoint "$@"' "$2" || exit 5
         found_rc=1
         shift 2
         continue
@@ -406,11 +563,20 @@ exit 2
                 """#!/bin/sh
 set -eu
 [ "$1" = "-cat" ] || exit 2
-printf '%s\n' \\
-  '. /usr/local/cargo/env' \\
-  'mkdir -p "/workspace" 2> /dev/null' \\
-  'cd "/workspace" && unset OLDPWD || exit 1' \\
-  'exec stale-entrypoint "$@"'
+case "$3" in
+  etc/rc)
+    printf '%s\n' \\
+      '. /usr/local/cargo/env' \\
+      'mkdir -p "/workspace" 2> /dev/null' \\
+      'cd "/workspace" && unset OLDPWD || exit 1' \\
+      'exec stale-entrypoint "$@"'
+    ;;
+  usr/local/cargo/env)
+    printf 'cat: no matches for /usr/local/cargo/env\n' >&2
+    exit 2
+    ;;
+  *) exit 2 ;;
+esac
 """
             )
             unsquashfs.chmod(0o755)
@@ -422,6 +588,10 @@ printf '%s\n' \\
             }
             with mock.patch.dict(os.environ, env, clear=False):
                 sandbox = EnrootSandbox("docker.io/example/task:latest")
+                expected_rc = b"""mkdir -p "/workspace" 2> /dev/null
+cd "/workspace" && unset OLDPWD || exit 1
+exec stale-entrypoint "$@"
+"""
 
                 async def exercise() -> None:
                     await sandbox.start()
@@ -441,14 +611,14 @@ printf '%s\n' \\
                     self.assertNotEqual(control_dir, session_tmp)
                     self.assertNotIn(session_tmp, control_dir.parents)
                     rc_path = control_dir / "rc"
-                    self.assertEqual(rc_path.read_text(), '#!/bin/sh\nexec "$@"\n')
+                    self.assertEqual(rc_path.read_bytes(), expected_rc)
                     self.assertEqual(rc_path.stat().st_mode & 0o777, 0o700)
                     runtime_path = control_dir / "runtime"
                     self.assertTrue(runtime_path.is_dir())
                     # The container sees session_tmp as /tmp; a task-created
                     # lookalike there cannot modify the unmounted control rc.
                     (session_tmp / "rc").write_text("task mutation")
-                    self.assertEqual(rc_path.read_text(), '#!/bin/sh\nexec "$@"\n')
+                    self.assertEqual(rc_path.read_bytes(), expected_rc)
                     self.assertEqual(sandbox.workdir, "/workspace")
                     start_args = sandbox._start_args("echo hello")
                     self.assertIn("--rc", start_args)
@@ -514,6 +684,199 @@ exec stale-entrypoint "$@"
             "/path with spaces",
         )
 
+    def test_selected_swe_rc_classes_are_preserved_byte_for_byte(self) -> None:
+        # The corresponding immutable rc.local files in the selected SWE-100
+        # corpus were audited as comments-only. The existing empty rc.local
+        # mount is therefore equivalent for these eight observed rc classes;
+        # this assertion covers /etc/rc itself, including every wrapper,
+        # entrypoint, and trailing newline.
+        self.assertEqual(len(_SWE_RC_CLASS_FIXTURES), 8)
+        for name, script in _SWE_RC_CLASS_FIXTURES.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    EnrootSandbox._sanitize_enroot_rc(
+                        script,
+                        cargo_env_exists=None,
+                    ),
+                    script,
+                )
+                EnrootSandbox._workdir_from_enroot_rc(script.decode())
+
+    def test_missing_cargo_source_is_removed_without_other_byte_changes(self) -> None:
+        script = (
+            b"\t.  /usr/local/cargo/env \t\n"
+            b"# preserved header\r\n"
+            b'mkdir -p "/workspace" 2> /dev/null\r\n'
+            b'cd "/workspace" && unset OLDPWD || exit 1\r\n'
+            b'exec preserved-entrypoint "$@"'
+        )
+        expected = (
+            b"# preserved header\r\n"
+            b'mkdir -p "/workspace" 2> /dev/null\r\n'
+            b'cd "/workspace" && unset OLDPWD || exit 1\r\n'
+            b'exec preserved-entrypoint "$@"'
+        )
+        self.assertEqual(
+            EnrootSandbox._sanitize_enroot_rc(
+                script,
+                cargo_env_exists=False,
+            ),
+            expected,
+        )
+        self.assertEqual(
+            EnrootSandbox._sanitize_enroot_rc(
+                b"source /usr/local/cargo/env",
+                cargo_env_exists=False,
+            ),
+            b"",
+        )
+
+    def test_existing_cargo_source_is_preserved_byte_for_byte(self) -> None:
+        script = (
+            b"source /usr/local/cargo/env\n"
+            b'mkdir -p "/workspace" 2> /dev/null\n'
+            b'cd "/workspace" && unset OLDPWD || exit 1\n'
+            b'exec preserved-entrypoint "$@"\n'
+        )
+        self.assertEqual(
+            EnrootSandbox._sanitize_enroot_rc(
+                script,
+                cargo_env_exists=True,
+            ),
+            script,
+        )
+
+    def test_cargo_source_sanitizer_rejects_ambiguous_inputs(self) -> None:
+        invalid_scripts = [
+            b'. "/usr/local/cargo/env"\n',
+            b". /usr/local/cargo/env || true\n",
+            b"echo /usr/local/cargo/env\n",
+            b". /usr/local/cargo/env\n. /usr/local/cargo/env\n",
+            b"# /usr/local/cargo/env\n",
+            b". /usr/local/cargo/env\r\n",
+            b". /usr/local/cargo/env\r",
+            b".\v/usr/local/cargo/env\n",
+            b".\f/usr/local/cargo/env\n",
+            b".\r/usr/local/cargo/env\n",
+            b"echo\r. /usr/local/cargo/env\n",
+            b"echo\v. /usr/local/cargo/env\n",
+            b"echo\f. /usr/local/cargo/env\n",
+            b"# metadata\n. /usr/local/cargo/env\n",
+            b"echo \\\n. /usr/local/cargo/env\n",
+            b"cat <<EOF\n. /usr/local/cargo/env\nEOF\n",
+        ]
+        for script in invalid_scripts:
+            with self.subTest(script=script):
+                with self.assertRaises(RuntimeError):
+                    EnrootSandbox._sanitize_enroot_rc(
+                        script,
+                        cargo_env_exists=False,
+                    )
+        with self.assertRaisesRegex(RuntimeError, "valid UTF-8"):
+            EnrootSandbox._sanitize_enroot_rc(
+                b"# \xff\n",
+                cargo_env_exists=None,
+            )
+
+    def test_cargo_presence_probe_is_fail_closed(self) -> None:
+        image = Path("immutable.sqsh")
+        cases = [
+            (0, b"cargo bytes", b"", True),
+            (
+                2,
+                b"",
+                b"cat: no matches for /usr/local/cargo/env\n",
+                False,
+            ),
+            (
+                2,
+                b"",
+                b"cat: no matches for /usr/local/cargo\n",
+                False,
+            ),
+        ]
+        for returncode, stdout, stderr, expected in cases:
+            with self.subTest(returncode=returncode):
+                completed = subprocess.CompletedProcess(
+                    args=["unsquashfs"],
+                    returncode=returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                with mock.patch(
+                    "sandbox_backends.subprocess.run",
+                    return_value=completed,
+                ):
+                    self.assertEqual(
+                        EnrootSandbox._cargo_env_exists_sync(
+                            "unsquashfs",
+                            image,
+                            timeout=1,
+                        ),
+                        expected,
+                    )
+        completed = subprocess.CompletedProcess(
+            args=["unsquashfs"],
+            returncode=1,
+            stdout=b"",
+            stderr=b"corrupt image\n",
+        )
+        with mock.patch(
+            "sandbox_backends.subprocess.run",
+            return_value=completed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "corrupt image"):
+                EnrootSandbox._cargo_env_exists_sync(
+                    "unsquashfs",
+                    image,
+                    timeout=1,
+                )
+
+    def test_sanitized_rc_executes_preserved_entrypoint_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            marker = root / "wrapper-ran"
+            wrapper = bin_dir / "preserved-entrypoint"
+            wrapper.write_text(
+                '#!/bin/sh\nprintf wrapped > "$WRAPPER_MARKER"\nexec "$@"\n'
+            )
+            wrapper.chmod(0o755)
+            workdir = root / "workdir"
+            script = (
+                b". /usr/local/cargo/env\n"
+                + f'mkdir -p "{workdir}" 2> /dev/null\n'.encode()
+                + f'cd "{workdir}" && unset OLDPWD || exit 1\n'.encode()
+                + b'exec preserved-entrypoint "$@"\n'
+            )
+            rc_path = root / "rc"
+            rc_path.write_bytes(
+                EnrootSandbox._sanitize_enroot_rc(
+                    script,
+                    cargo_env_exists=False,
+                )
+            )
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+                    "WRAPPER_MARKER": str(marker),
+                }
+            )
+            result = subprocess.run(
+                [str(shutil.which("sh")), str(rc_path), "sh", "-c", "printf payload"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "payload")
+            self.assertEqual(marker.read_text(), "wrapped")
+            self.assertTrue(workdir.is_dir())
+
     def test_enroot_workdir_parser_fails_closed(self) -> None:
         invalid_scripts = [
             "exec stale-entrypoint\n",
@@ -537,7 +900,7 @@ exec stale-entrypoint "$@"
             return_value=None,
         ):
             with self.assertRaisesRegex(RuntimeError, "requires unsquashfs"):
-                sandbox._image_workdir_sync(Path("unused.sqsh"))
+                sandbox._image_runtime_config_sync(Path("unused.sqsh"))
 
     def test_concurrent_sandboxes_use_distinct_unmounted_runtime_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -581,7 +944,7 @@ exec stale-entrypoint "$@"
                 ),
                 mock.patch.object(
                     sandbox,
-                    "_image_workdir_sync",
+                    "_image_runtime_config_sync",
                     side_effect=RuntimeError("inspect failed"),
                 ),
                 mock.patch(
