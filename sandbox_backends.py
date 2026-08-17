@@ -12,6 +12,7 @@ import asyncio
 import fcntl
 import hashlib
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -358,10 +359,7 @@ def local_image_reference(image: str) -> str:
     cache keys.
     """
     if image.startswith(_PRIME_SWE_IMAGE_PREFIX):
-        return (
-            "docker.io/swerebenchv2/"
-            + image.removeprefix(_PRIME_SWE_IMAGE_PREFIX)
-        )
+        return "docker.io/swerebenchv2/" + image.removeprefix(_PRIME_SWE_IMAGE_PREFIX)
     return image
 
 
@@ -426,6 +424,8 @@ class EnrootSandbox:
         )
         self.root_remap = _env_bool("SWE_ENROOT_ROOT_REMAP", True)
         self.session_tmp_dir: Path | None = None
+        self.enroot_control_dir: Path | None = None
+        self.workdir: str | None = None
         self.namespace_control_dir: Path | None = None
         self.started = False
         self._pid_namespace_process: asyncio.subprocess.Process | None = None
@@ -462,9 +462,7 @@ class EnrootSandbox:
             tmp_path.unlink(missing_ok=True)
 
             try:
-                attempts = max(
-                    1, int(os.getenv("SWE_ENROOT_IMPORT_ATTEMPTS", "3"))
-                )
+                attempts = max(1, int(os.getenv("SWE_ENROOT_IMPORT_ATTEMPTS", "3")))
                 retry_delay = max(
                     0.0,
                     float(
@@ -500,7 +498,11 @@ class EnrootSandbox:
                             text=True,
                             timeout=timeout,
                             check=False,
-                            env=_enroot_import_environment(),
+                            env=(
+                                self._enroot_environment(_enroot_import_environment())
+                                if self.session_tmp_dir is not None
+                                else _enroot_import_environment()
+                            ),
                         )
                     except subprocess.TimeoutExpired as error:
                         errors.append(
@@ -912,10 +914,15 @@ class EnrootSandbox:
     def _start_args(self, command: str) -> list[str]:
         if self.session_tmp_dir is None:
             raise RuntimeError("Enroot sandbox session tmp has not been created")
+        if self.enroot_control_dir is None:
+            raise RuntimeError("Enroot sandbox control dir has not been created")
+        rc_path = self.enroot_control_dir / "rc"
         args = [
             "enroot",
             "start",
             "--rw",
+            "--rc",
+            str(rc_path),
         ]
         if self.root_remap:
             args.append("--root")
@@ -926,11 +933,8 @@ class EnrootSandbox:
             if mount:
                 args += ["--mount", mount]
 
-        # Enroot's generated /etc/rc establishes the image WORKDIR before it
-        # executes our explicit command. Image ENTRYPOINT logic lives in
-        # /etc/rc.local, so replace only that file with an empty session-local
-        # file: this preserves WORKDIR semantics without running a stale image
-        # entrypoint.
+        # Keep rc.local empty as defense in depth. The pass-through --rc above
+        # is what prevents Enroot from executing the image ENTRYPOINT itself.
         rc_local_path = self.session_tmp_dir / ".openreward-enroot-rc.local"
         args += ["--mount", f"{rc_local_path}:/etc/rc.local"]
         args += ["--mount", f"{self.session_tmp_dir}:/tmp"]
@@ -939,11 +943,78 @@ class EnrootSandbox:
         # `git config --global` race on the same /root/.gitconfig.lock. Keep
         # Git's global config in the already session-private /tmp mount and
         # export the override for every command, including later agent tools.
+        if self.workdir is not None:
+            quoted_workdir = shlex.quote(self.workdir)
+            command = (
+                f"mkdir -p -- {quoted_workdir} 2>/dev/null && "
+                f"cd {quoted_workdir} && {command}"
+            )
         isolated_command = (
             "export GIT_CONFIG_GLOBAL=/tmp/.gitconfig-openreward; " + command
         )
         args += [self.name, "/bin/sh", "-c", isolated_command]
         return args
+
+    def _enroot_environment(
+        self,
+        base: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        if self.enroot_control_dir is None:
+            raise RuntimeError("Enroot sandbox control dir has not been created")
+        runtime_path = self.enroot_control_dir / "runtime"
+        runtime_path.mkdir(mode=0o700, exist_ok=True)
+        environment = dict(os.environ if base is None else base)
+        environment["ENROOT_MOUNT_HOME"] = ""
+        environment["ENROOT_RUNTIME_PATH"] = str(runtime_path)
+        return environment
+
+    @staticmethod
+    def _workdir_from_enroot_rc(script: str) -> str:
+        """Extract the OCI WORKDIR from Enroot's generated command script."""
+
+        workdirs: list[str] = []
+        suffix = ["&&", "unset", "OLDPWD", "||", "exit", "1"]
+        for line in script.splitlines():
+            try:
+                words = shlex.split(line, posix=True)
+            except ValueError:
+                continue
+            if len(words) >= 2 and words[0] == "cd" and words[2:] == suffix:
+                workdirs.append(words[1])
+        if len(workdirs) != 1:
+            raise RuntimeError(
+                "Could not determine OCI workdir from Enroot command script"
+            )
+        workdir = workdirs[0]
+        if not workdir.startswith("/") or "\x00" in workdir:
+            raise RuntimeError(
+                f"Invalid OCI workdir in Enroot command script: {workdir!r}"
+            )
+        return workdir
+
+    def _image_workdir_sync(self, image_path: Path) -> str:
+        """Read OCI WORKDIR metadata from an immutable cached Enroot image."""
+
+        timeout = float(os.getenv("SWE_ENROOT_INSPECT_TIMEOUT_SECONDS", "120"))
+        unsquashfs = shutil.which("unsquashfs")
+        if unsquashfs is None:
+            raise RuntimeError(
+                "SWE_SANDBOX_RUNTIME=enroot requires unsquashfs to inspect OCI WORKDIR"
+            )
+        result = subprocess.run(
+            [unsquashfs, "-cat", str(image_path), "etc/rc"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Could not inspect cached Enroot image command script: "
+                + result.stdout.strip()
+            )
+        return self._workdir_from_enroot_rc(result.stdout)
 
     async def start(self) -> None:
         if shutil.which("enroot") is None:
@@ -952,7 +1023,6 @@ class EnrootSandbox:
             raise RuntimeError("Enroot sandbox has already been started")
 
         try:
-            image_path = await asyncio.to_thread(self._ensure_image_sync)
             tmp_root_value = os.getenv("SWE_ENROOT_SESSION_TMP_ROOT")
             tmp_root = Path(tmp_root_value).expanduser() if tmp_root_value else None
             if tmp_root is not None:
@@ -962,6 +1032,22 @@ class EnrootSandbox:
                     prefix=f"{self.name}-tmp-",
                     dir=tmp_root,
                 )
+            )
+            self.enroot_control_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f"{self.name}-enroot-control-",
+                    dir=tmp_root,
+                )
+            )
+            self.enroot_control_dir.chmod(0o700)
+            self._enroot_environment()
+            image_path = await asyncio.to_thread(self._ensure_image_sync)
+            # Inspect immutable image metadata on the host. Never execute the
+            # node-local writable rootfs's /etc/rc: in addition to containing
+            # OCI ENTRYPOINT logic, that runtime file may be stale or damaged.
+            self.workdir = await asyncio.to_thread(
+                self._image_workdir_sync,
+                image_path,
             )
             self.namespace_control_dir = Path(
                 tempfile.mkdtemp(
@@ -973,6 +1059,12 @@ class EnrootSandbox:
             rc_local_path = self.session_tmp_dir / ".openreward-enroot-rc.local"
             rc_local_path.write_text("")
             rc_local_path.chmod(0o600)
+            rc_path = self.enroot_control_dir / "rc"
+            # `enroot start NAME COMMAND` still prepends the OCI ENTRYPOINT.
+            # Use a host-side pass-through rc so stale image startup code (for
+            # example `. /usr/local/cargo/env`) can never run.
+            rc_path.write_text('#!/bin/sh\nexec "$@"\n')
+            rc_path.chmod(0o700)
             # Mark removal necessary before spawning create: cancellation can
             # arrive after Enroot creates the named rootfs but before the
             # subprocess result reaches this coroutine.
@@ -980,6 +1072,7 @@ class EnrootSandbox:
             result = await _run_process(
                 ["enroot", "create", "--name", self.name, str(image_path)],
                 timeout=float(os.getenv("SWE_SANDBOX_CREATE_TIMEOUT_SECONDS", "1800")),
+                env=self._enroot_environment(),
             )
             if result.return_code != 0:
                 raise RuntimeError(
@@ -1018,7 +1111,7 @@ class EnrootSandbox:
                     # Never let an untrusted task inherit that host path. An
                     # explicit empty value disables the hook even when the
                     # parent environment sets ENROOT_MOUNT_HOME.
-                    env={**os.environ, "ENROOT_MOUNT_HOME": ""},
+                    env=self._enroot_environment(),
                     stdin_data=stdin_data,
                 )
             except (FileNotFoundError, PermissionError, OSError) as error:
@@ -1055,12 +1148,11 @@ class EnrootSandbox:
                 result = await _run_process(
                     ["enroot", "remove", "-f", self.name],
                     timeout=120,
+                    env=self._enroot_environment(),
                 )
             except Exception as error:
                 self.started = False
-                raise RuntimeError(
-                    f"Enroot sandbox removal failed: {error}"
-                ) from error
+                raise RuntimeError(f"Enroot sandbox removal failed: {error}") from error
             if result.return_code != 0:
                 self.started = False
                 raise RuntimeError(
@@ -1070,6 +1162,10 @@ class EnrootSandbox:
         if self.session_tmp_dir is not None:
             shutil.rmtree(self.session_tmp_dir, ignore_errors=True)
             self.session_tmp_dir = None
+        if self.enroot_control_dir is not None:
+            shutil.rmtree(self.enroot_control_dir, ignore_errors=True)
+            self.enroot_control_dir = None
+        self.workdir = None
         if self.namespace_control_dir is not None:
             shutil.rmtree(self.namespace_control_dir, ignore_errors=True)
             self.namespace_control_dir = None

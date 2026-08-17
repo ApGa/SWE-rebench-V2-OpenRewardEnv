@@ -24,6 +24,12 @@ from sandbox_backends import (
 )
 
 
+async def _inline_to_thread(function, /, *args, **kwargs):
+    """Keep subprocess-mocked unit tests independent of executor shutdown."""
+
+    return function(*args, **kwargs)
+
+
 def _task(instance_id: str, test_cmd: str | list[str]) -> dict:
     return {
         "instance_id": instance_id,
@@ -113,10 +119,7 @@ class TaskDatasetTest(unittest.TestCase):
                 sys.modules.pop("server", None)
                 server = importlib.import_module("server")
 
-            tools = {
-                tool.name: tool
-                for tool in server.SWERebenchV2.list_tools().tools
-            }
+            tools = {tool.name: tool for tool in server.SWERebenchV2.list_tools().tools}
             key = server.TOOL_ROUTING_SCHEMA_KEY
 
             bash_schema = tools["bash"].input_schema
@@ -166,12 +169,8 @@ class TaskDatasetTest(unittest.TestCase):
 
 class SandboxHelpersTest(unittest.TestCase):
     def test_prime_verified_image_maps_to_upstream_oci_reference(self) -> None:
-        prime_image = (
-            "prime/primeintellect/elastic-synthetics:316-f52f0bf"
-        )
-        upstream_image = (
-            "docker.io/swerebenchv2/elastic-synthetics:316-f52f0bf"
-        )
+        prime_image = "prime/primeintellect/elastic-synthetics:316-f52f0bf"
+        upstream_image = "docker.io/swerebenchv2/elastic-synthetics:316-f52f0bf"
         self.assertEqual(local_image_reference(prime_image), upstream_image)
         self.assertEqual(
             _enroot_import_uri(prime_image),
@@ -309,6 +308,19 @@ exit 2
 """
             )
             enroot.chmod(0o755)
+            unsquashfs = bin_dir / "unsquashfs"
+            unsquashfs.write_text(
+                """#!/bin/sh
+set -eu
+[ "$1" = "-cat" ] || exit 2
+printf '%s\n' \\
+  '. /usr/local/cargo/env' \\
+  'mkdir -p "/workspace" 2> /dev/null' \\
+  'cd "/workspace" && unset OLDPWD || exit 1' \\
+  'exec stale-entrypoint "$@"'
+"""
+            )
+            unsquashfs.chmod(0o755)
 
             env = {
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -354,6 +366,33 @@ case "$1" in
       printf 'unsafe ENROOT_MOUNT_HOME=%s' "${ENROOT_MOUNT_HOME-unset}"
       exit 3
     fi
+    all_args="$*"
+    found_rc=0
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--rc" ]; then
+        [ -f "$2" ] || exit 4
+        grep -q 'exec "$@"' "$2" || exit 5
+        found_rc=1
+        shift 2
+        continue
+      fi
+      shift
+    done
+    [ "$found_rc" -eq 1 ] || {
+      # Reproduce the stale OCI entrypoint this regression guards against.
+      printf '/etc/rc: 1: .: cannot open /usr/local/cargo/env: No such file'
+      exit 6
+    }
+    case "$all_args" in
+      *"cat /etc/rc"*)
+        printf '%s\n' \
+          '. /usr/local/cargo/env' \
+          'mkdir -p "/workspace" 2> /dev/null' \
+          'cd "/workspace" && unset OLDPWD || exit 1' \
+          'exec stale-entrypoint "$@"'
+        exit 0
+        ;;
+    esac
     printf 'fake command output'
     exit 0
     ;;
@@ -362,6 +401,19 @@ exit 2
 """
             )
             enroot.chmod(0o755)
+            unsquashfs = bin_dir / "unsquashfs"
+            unsquashfs.write_text(
+                """#!/bin/sh
+set -eu
+[ "$1" = "-cat" ] || exit 2
+printf '%s\n' \\
+  '. /usr/local/cargo/env' \\
+  'mkdir -p "/workspace" 2> /dev/null' \\
+  'cd "/workspace" && unset OLDPWD || exit 1' \\
+  'exec stale-entrypoint "$@"'
+"""
+            )
+            unsquashfs.chmod(0o755)
 
             env = {
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -377,16 +429,32 @@ exit 2
                     self.assertIsNotNone(session_tmp)
                     assert session_tmp is not None
                     self.assertTrue(session_tmp.is_dir())
-                    rc_local_path = (
-                        session_tmp / ".openreward-enroot-rc.local"
-                    )
+                    rc_local_path = session_tmp / ".openreward-enroot-rc.local"
                     self.assertEqual(rc_local_path.read_text(), "")
                     self.assertEqual(
                         rc_local_path.stat().st_mode & 0o777,
                         0o600,
                     )
+                    control_dir = sandbox.enroot_control_dir
+                    self.assertIsNotNone(control_dir)
+                    assert control_dir is not None
+                    self.assertNotEqual(control_dir, session_tmp)
+                    self.assertNotIn(session_tmp, control_dir.parents)
+                    rc_path = control_dir / "rc"
+                    self.assertEqual(rc_path.read_text(), '#!/bin/sh\nexec "$@"\n')
+                    self.assertEqual(rc_path.stat().st_mode & 0o777, 0o700)
+                    runtime_path = control_dir / "runtime"
+                    self.assertTrue(runtime_path.is_dir())
+                    # The container sees session_tmp as /tmp; a task-created
+                    # lookalike there cannot modify the unmounted control rc.
+                    (session_tmp / "rc").write_text("task mutation")
+                    self.assertEqual(rc_path.read_text(), '#!/bin/sh\nexec "$@"\n')
+                    self.assertEqual(sandbox.workdir, "/workspace")
                     start_args = sandbox._start_args("echo hello")
-                    self.assertNotIn("--rc", start_args)
+                    self.assertIn("--rc", start_args)
+                    self.assertEqual(
+                        start_args[start_args.index("--rc") + 1], str(rc_path)
+                    )
                     self.assertNotIn("-lc", start_args)
                     self.assertEqual(start_args[-3:-1], ["/bin/sh", "-c"])
                     self.assertIn(
@@ -397,23 +465,161 @@ exit 2
                         f"{session_tmp}:/tmp",
                         start_args,
                     )
+                    mount_sources = [
+                        start_args[index + 1].split(":", 1)[0]
+                        for index, value in enumerate(start_args)
+                        if value == "--mount"
+                    ]
+                    self.assertNotIn(str(control_dir), mount_sources)
+                    self.assertTrue(
+                        all(
+                            not Path(source).is_relative_to(control_dir)
+                            for source in mount_sources
+                        )
+                    )
                     self.assertEqual(
                         start_args[-1],
                         "export GIT_CONFIG_GLOBAL=/tmp/.gitconfig-openreward; "
-                        "echo hello",
+                        "mkdir -p -- /workspace 2>/dev/null && "
+                        "cd /workspace && echo hello",
                     )
                     result = await sandbox.run("echo hello")
                     self.assertEqual(result.return_code, 0)
                     self.assertEqual(result.output, "fake command output")
                     await sandbox.stop()
                     self.assertIsNone(sandbox.session_tmp_dir)
+                    self.assertIsNone(sandbox.enroot_control_dir)
                     self.assertFalse(session_tmp.exists())
+                    self.assertFalse(control_dir.exists())
 
-                asyncio.run(exercise())
+                with mock.patch(
+                    "sandbox_backends.asyncio.to_thread",
+                    side_effect=_inline_to_thread,
+                ):
+                    asyncio.run(exercise())
                 self.assertEqual(
                     len(list((root / "images").glob("*.sqsh"))),
                     1,
                 )
+
+    def test_enroot_workdir_parser_ignores_stale_entrypoint(self) -> None:
+        script = """\
+. /usr/local/cargo/env
+mkdir -p "/path with spaces" 2> /dev/null
+cd "/path with spaces" && unset OLDPWD || exit 1
+exec stale-entrypoint "$@"
+"""
+        self.assertEqual(
+            EnrootSandbox._workdir_from_enroot_rc(script),
+            "/path with spaces",
+        )
+
+    def test_enroot_workdir_parser_fails_closed(self) -> None:
+        invalid_scripts = [
+            "exec stale-entrypoint\n",
+            (
+                'cd "/one" && unset OLDPWD || exit 1\n'
+                'cd "/two" && unset OLDPWD || exit 1\n'
+            ),
+            'cd "relative" && unset OLDPWD || exit 1\n',
+            'cd "/workspace" && unset OLDPWD || exit 1; echo trailing\n',
+            'cd "unterminated && unset OLDPWD || exit 1\n',
+        ]
+        for script in invalid_scripts:
+            with self.subTest(script=script):
+                with self.assertRaises(RuntimeError):
+                    EnrootSandbox._workdir_from_enroot_rc(script)
+
+    def test_enroot_workdir_inspection_requires_unsquashfs(self) -> None:
+        sandbox = EnrootSandbox("docker.io/example/task:latest")
+        with mock.patch(
+            "sandbox_backends.shutil.which",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires unsquashfs"):
+                sandbox._image_workdir_sync(Path("unused.sqsh"))
+
+    def test_concurrent_sandboxes_use_distinct_unmounted_runtime_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sandboxes = [
+                EnrootSandbox("docker.io/example/one:latest"),
+                EnrootSandbox("docker.io/example/two:latest"),
+            ]
+            for index, sandbox in enumerate(sandboxes):
+                sandbox.session_tmp_dir = root / f"mounted-{index}"
+                sandbox.session_tmp_dir.mkdir()
+                sandbox.enroot_control_dir = root / f"control-{index}"
+                sandbox.enroot_control_dir.mkdir(mode=0o700)
+
+            # Both live sandboxes prepare their control state before either is
+            # torn down; no executor thread is needed to prove path isolation.
+            environments = [sandbox._enroot_environment() for sandbox in sandboxes]
+            runtime_paths = [
+                Path(environment["ENROOT_RUNTIME_PATH"]) for environment in environments
+            ]
+            self.assertEqual(len(set(runtime_paths)), 2)
+            for sandbox, runtime_path in zip(sandboxes, runtime_paths):
+                assert sandbox.enroot_control_dir is not None
+                assert sandbox.session_tmp_dir is not None
+                self.assertTrue(runtime_path.is_relative_to(sandbox.enroot_control_dir))
+                self.assertFalse(runtime_path.is_relative_to(sandbox.session_tmp_dir))
+
+    def test_inspection_failure_cleans_unmounted_control_dirs(self) -> None:
+        sandbox = EnrootSandbox("docker.io/example/task:inspect-failure")
+
+        async def exercise() -> None:
+            with (
+                mock.patch(
+                    "sandbox_backends.shutil.which",
+                    return_value="/usr/bin/enroot",
+                ),
+                mock.patch.object(
+                    sandbox,
+                    "_ensure_image_sync",
+                    return_value=Path("cached.sqsh"),
+                ),
+                mock.patch.object(
+                    sandbox,
+                    "_image_workdir_sync",
+                    side_effect=RuntimeError("inspect failed"),
+                ),
+                mock.patch(
+                    "sandbox_backends.asyncio.to_thread",
+                    side_effect=_inline_to_thread,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "inspect failed"):
+                    await sandbox.start()
+
+        asyncio.run(exercise())
+        self.assertIsNone(sandbox.session_tmp_dir)
+        self.assertIsNone(sandbox.enroot_control_dir)
+        self.assertIsNone(sandbox.namespace_control_dir)
+        self.assertFalse(sandbox._container_created)
+
+    def test_missing_image_workdir_is_created_before_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sandbox = EnrootSandbox("docker.io/example/task:latest")
+            sandbox.session_tmp_dir = root / "mounted-tmp"
+            sandbox.session_tmp_dir.mkdir()
+            sandbox.enroot_control_dir = root / "control"
+            sandbox.enroot_control_dir.mkdir(mode=0o700)
+            (sandbox.enroot_control_dir / "rc").write_text('#!/bin/sh\nexec "$@"\n')
+            missing = root / "missing workdir"
+            sandbox.workdir = str(missing)
+            command = sandbox._start_args("printf swe-workdir-ok")[-1]
+            result = subprocess.run(
+                ["/bin/sh", "-c", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "swe-workdir-ok")
+            self.assertTrue(missing.is_dir())
 
 
 if __name__ == "__main__":
